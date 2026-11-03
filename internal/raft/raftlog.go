@@ -1,0 +1,589 @@
+package raft
+
+import (
+	"bufio"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+
+	"go.uber.org/zap"
+
+	"github.com/TheWor1d877/mini-Raft-KV/internal/kvstore"
+)
+
+// raft 日志的 entry 布局（3.1 §5）：op 1B(=0x10) | term 8B | index 8B | command 变长，全部大端。
+// kvstore 的 WAL 用 op 0x01，两套 op 值不重叠，读错目录立刻判坏记录。
+const (
+	OpRaftEntry = byte(0x10)
+
+	raftEntryTermOffset  = 1
+	raftEntryIndexOffset = 9
+	raftEntryHeaderSize  = 1 + 8 + 8
+
+	// 日志索引从 1 起，空日志的 lastLogIndex 是 0（doc 3 基线的日志修复一节）。
+	firstRaftIndex = uint64(1)
+
+	// 段文件序号独立于日志索引，同样从 1 起。
+	firstRaftSegment = uint64(1)
+)
+
+func encodeRaftEntry(term, index uint64, command []byte) []byte {
+	entry := make([]byte, raftEntryHeaderSize+len(command))
+	entry[0] = OpRaftEntry
+	binary.BigEndian.PutUint64(entry[raftEntryTermOffset:], term)
+	binary.BigEndian.PutUint64(entry[raftEntryIndexOffset:], index)
+	copy(entry[raftEntryHeaderSize:], command)
+	return entry
+}
+
+// decodeRaftEntry 解一条 entry。command 允许是空字节串：no-op 条目就长这样（3.1 §7）。
+// 帧头那一层的 len 与 crc 由调用方先过（3.1 §5 的判定顺序），这里只管 entry 内部。
+func decodeRaftEntry(entry []byte, offset int64) (term, index uint64, command []byte, err error) {
+	if len(entry) < raftEntryHeaderSize {
+		return 0, 0, nil, kvstore.ErrCorruptAt(offset,
+			fmt.Sprintf("entry is %d bytes, below the %d-byte raft header", len(entry), raftEntryHeaderSize))
+	}
+	if op := entry[0]; op != OpRaftEntry {
+		return 0, 0, nil, kvstore.ErrCorruptAt(offset, fmt.Sprintf("unknown op 0x%02x", op))
+	}
+	return binary.BigEndian.Uint64(entry[raftEntryTermOffset:]),
+		binary.BigEndian.Uint64(entry[raftEntryIndexOffset:]),
+		entry[raftEntryHeaderSize:], nil
+}
+
+// raftEntry 是一条日志条目，连它在盘上的位置一起记着：按 index 截断尾部要拿这些字段定位帧起点（3.1 §5）。
+type raftEntry struct {
+	term   uint64
+	index  uint64
+	cmd    []byte
+	seq    uint64 // 段文件序号
+	offset int64  // 段内字节偏移，指向帧头
+	size   int64  // 帧总长，含 8 字节帧头
+}
+
+// raftLog 是 log[] 的内存视图与落盘。帧与 crc 用 kvstore 的原语，文件树独立（D15）。
+type raftLog struct {
+	cfg Config
+	lg  *zap.Logger
+
+	file *os.File
+	seq  uint64
+	size int64
+
+	entries []*raftEntry
+
+	// D20 的两个映射：Follower 回 conflictIndex 用首条，Leader 反查 nextIndex 用末条。
+	firstIndexByTerm map[uint64]uint64
+	lastIndexByTerm  map[uint64]uint64
+
+	// failed 是 D5 的失效标志：Sync 失败之后盘上边界未知，写路径一律拒绝。
+	failed bool
+}
+
+// openRaftLog 先扫描重建视图，再在最大序号文件末尾准备追加（3.1 §7）。
+// 扫描会就地裁剪坏尾，所以列段放在扫描之后，拿到的才是裁剪后的长度。
+func openRaftLog(cfg Config, lg *zap.Logger) (*raftLog, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	log := kvstore.WithComponent(lg, ComponentRaftLog)
+	entries, err := scanRaftLog(cfg, log)
+	if err != nil {
+		return nil, err
+	}
+
+	l := &raftLog{
+		cfg:              cfg,
+		lg:               log,
+		entries:          entries,
+		firstIndexByTerm: map[uint64]uint64{},
+		lastIndexByTerm:  map[uint64]uint64{},
+	}
+	l.rebuildTermIndex()
+
+	segs, err := listRaftSegments(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if len(segs) > 0 {
+		last := segs[len(segs)-1]
+		f, err := os.OpenFile(last.path, os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return nil, kvstore.ErrIOFrom("open raft log file", last.size, err)
+		}
+		l.file, l.seq, l.size = f, last.seq, last.size
+		return l, nil
+	}
+	f, err := createRaftSegment(cfg, firstRaftSegment)
+	if err != nil {
+		return nil, err
+	}
+	l.file, l.seq, l.size = f, firstRaftSegment, 0
+	return l, nil
+}
+
+// appendEntry 追加一条并检查 index 连续（不变式 6：日志中间不许有洞）。
+// 这里不 Sync：Leader 一条一 Sync、Follower 一批一次，落盘节奏由调用方定（3.1 §7、D19）。
+func (l *raftLog) appendEntry(term, index uint64, command []byte) (*raftEntry, error) {
+	if err := l.writeBlocked(); err != nil {
+		return nil, err
+	}
+	if want := l.lastIndex() + 1; index != want {
+		return nil, ErrStateMismatchAt(index, fmt.Sprintf("appended index %d but the log wants %d", index, want))
+	}
+	frame, err := kvstore.EncodeFrame(encodeRaftEntry(term, index, command))
+	if err != nil {
+		return nil, err
+	}
+	if l.size+int64(len(frame)) > l.cfg.MaxFileSize {
+		if err := l.rollover(); err != nil {
+			return nil, err
+		}
+	}
+
+	e := &raftEntry{term: term, index: index, cmd: command, seq: l.seq, offset: l.size, size: int64(len(frame))}
+	n, err := l.file.Write(frame)
+	l.size += int64(n)
+	if err != nil {
+		return nil, kvstore.ErrIOFrom("append raft log record", e.offset, err)
+	}
+	l.entries = append(l.entries, e)
+	l.trackTerm(e)
+	return e, nil
+}
+
+// sync 落一次盘。`-raft-fsync=false` 只跳过这个系统调用，追加与文件照常（D19）。
+// 失败之后盘上有什么已经判断不了，写路径自此关闭（D5）。
+func (l *raftLog) sync() error {
+	if err := l.writeBlocked(); err != nil {
+		return err
+	}
+	if l.cfg.Fsync {
+		if err := l.file.Sync(); err != nil {
+			l.disable(err)
+			return kvstore.ErrIOFrom("fsync raft log", l.size, err)
+		}
+	}
+	return nil
+}
+
+func (l *raftLog) close() error {
+	if l.file == nil {
+		return nil
+	}
+	var err error
+	if !l.failed {
+		err = l.sync()
+	}
+	if cerr := l.file.Close(); err == nil {
+		err = kvstore.ErrIOFrom("close raft log file", l.size, cerr)
+	}
+	l.file = nil
+	return err
+}
+
+// 写路径是否已关：读路径不受影响（D5）。
+func (l *raftLog) disabled() bool { return l.failed }
+
+func (l *raftLog) writeBlocked() error {
+	if l.failed || l.file == nil {
+		return errRaftLogDisabled
+	}
+	return nil
+}
+
+func (l *raftLog) disable(cause error) {
+	if l.failed {
+		return
+	}
+	l.failed = true
+	l.lg.Error("raft log disabled",
+		zap.Int64("failed_at_offset", l.size),
+		zap.Error(cause))
+}
+
+// 换段：旧文件先落盘，新段以临时名创建再原子改名。建新段失败不置失效（3.1 §7）。
+func (l *raftLog) rollover() error {
+	if err := l.sync(); err != nil {
+		return err
+	}
+	next := l.seq + 1
+	f, err := createRaftSegment(l.cfg, next)
+	if err != nil {
+		return err
+	}
+	if err := l.file.Close(); err != nil {
+		_ = f.Close()
+		return kvstore.ErrIOFrom("close raft log file", l.size, err)
+	}
+	l.lg.Info("raft log rolled over",
+		zap.String("from_file", l.cfg.RaftLogPath(l.seq)),
+		zap.String("to_file", l.cfg.RaftLogPath(next)),
+		zap.Int64("size_bytes", l.size))
+	l.file, l.seq, l.size = f, next, 0
+	return nil
+}
+
+// truncateTo 丢掉 index 之后的全部条目，保留 index 及其之前的（3.1 §5）。
+// index=0 清空整棵日志。截到的每个文件都单独 Sync：这段截断也是复制回执承诺的盘上边界（D19）。
+func (l *raftLog) truncateTo(index uint64) error {
+	if err := l.writeBlocked(); err != nil {
+		return err
+	}
+	keep := 0
+	for _, e := range l.entries {
+		if e.index > index {
+			break
+		}
+		keep++
+	}
+	if keep == len(l.entries) {
+		return nil
+	}
+
+	segs, err := listRaftSegments(l.cfg)
+	if err != nil {
+		return err
+	}
+	if keep > 0 {
+		b := l.entries[keep-1]
+		for _, s := range segs {
+			switch {
+			case s.seq < b.seq:
+			case s.seq == b.seq:
+				if err := truncateRaftFile(s.path, b.offset+b.size); err != nil {
+					return err
+				}
+			default:
+				if err := truncateRaftFile(s.path, 0); err != nil {
+					return err
+				}
+			}
+		}
+		if err := l.resumeAt(b.seq, b.offset+b.size); err != nil {
+			return err
+		}
+	} else {
+		for _, s := range segs {
+			if err := truncateRaftFile(s.path, 0); err != nil {
+				return err
+			}
+		}
+		if err := l.resumeAt(firstRaftIndex, 0); err != nil {
+			return err
+		}
+	}
+
+	dropped := len(l.entries) - keep
+	l.entries = l.entries[:keep]
+	l.rebuildTermIndex()
+	l.lg.Info("raft log suffix dropped",
+		zap.Uint64("kept_through_index", index),
+		zap.Int("dropped_entries", dropped),
+		zap.Int("entries_left", keep))
+	return nil
+}
+
+// resumeAt 把追加位置挪回 seq 那个段，长度按 size 记账；段文件不存在（日志清空后）就新建。
+func (l *raftLog) resumeAt(seq uint64, size int64) error {
+	if l.file != nil {
+		if err := l.file.Close(); err != nil {
+			return kvstore.ErrIOFrom("close raft log file", l.size, err)
+		}
+		l.file = nil
+	}
+	path := l.cfg.RaftLogPath(seq)
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		f, err := createRaftSegment(l.cfg, seq)
+		if err != nil {
+			return err
+		}
+		l.file, l.seq, l.size = f, seq, 0
+		return nil
+	} else if err != nil {
+		return kvstore.ErrIOFrom("stat raft log file", 0, err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return kvstore.ErrIOFrom("open raft log file", size, err)
+	}
+	l.file, l.seq, l.size = f, seq, size
+	return nil
+}
+
+// lastIndex 是日志最后一条的 index，空日志返回 0。
+func (l *raftLog) lastIndex() uint64 {
+	if len(l.entries) == 0 {
+		return 0
+	}
+	return l.entries[len(l.entries)-1].index
+}
+
+// lastTerm 是最后一条的 term，空日志返回 0；投票时比较日志新旧要用（3.1 §7 第 4 步）。
+func (l *raftLog) lastTerm() uint64 {
+	if len(l.entries) == 0 {
+		return 0
+	}
+	return l.entries[len(l.entries)-1].term
+}
+
+func (l *raftLog) length() int { return len(l.entries) }
+
+// entryAt 按 index 取一条。本期没有压缩，日志恒从 1 起，所以 index-1 就是下标。
+func (l *raftLog) entryAt(index uint64) (*raftEntry, bool) {
+	if index < firstRaftIndex || int(index) > len(l.entries) {
+		return nil, false
+	}
+	return l.entries[index-1], true
+}
+
+// entriesFrom 取 index 及其之后、最多 limit 条，用于组一次 AppendEntries（3.4 T23.1）。
+func (l *raftLog) entriesFrom(index uint64, limit int) []*raftEntry {
+	if index < firstRaftIndex {
+		index = firstRaftIndex
+	}
+	if int(index) > len(l.entries) {
+		return nil
+	}
+	out := l.entries[index-1:]
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// 一个 term 在本节点日志里的第一条 index，Follower 用它回 conflictIndex（D20）。
+func (l *raftLog) firstIndexOfTerm(term uint64) (uint64, bool) {
+	index, ok := l.firstIndexByTerm[term]
+	return index, ok
+}
+
+// 一个 term 在本节点日志里的最后一条 index，Leader 用它落 nextIndex（D20）。
+func (l *raftLog) lastIndexOfTerm(term uint64) (uint64, bool) {
+	index, ok := l.lastIndexByTerm[term]
+	return index, ok
+}
+
+func (l *raftLog) trackTerm(e *raftEntry) {
+	if _, ok := l.firstIndexByTerm[e.term]; !ok {
+		l.firstIndexByTerm[e.term] = e.index
+	}
+	l.lastIndexByTerm[e.term] = e.index
+}
+
+// 截断之后两个映射一起重建：被丢掉的那批可能同时带走了某个 term 的首条和末条，
+// 增量维护要分四种情况，不如按剩下的条目重扫一遍。
+func (l *raftLog) rebuildTermIndex() {
+	l.firstIndexByTerm = map[uint64]uint64{}
+	l.lastIndexByTerm = map[uint64]uint64{}
+	for _, e := range l.entries {
+		l.trackTerm(e)
+	}
+}
+
+// 一个已提交的 raft 日志段。
+type raftSegment struct {
+	seq  uint64
+	path string
+	size int64
+}
+
+// listRaftSegments 按序号排好列出正式名的段；`*.tmp` 是没来得及提交的空文件，扫描之前先删掉（2.1 §6）。
+func listRaftSegments(cfg Config) ([]raftSegment, error) {
+	entries, err := os.ReadDir(cfg.RaftLogDir())
+	if err != nil {
+		return nil, kvstore.ErrIOFrom("list raft log dir", 0, err)
+	}
+	segs := make([]raftSegment, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if filepath.Ext(name) == ".tmp" {
+			if err := os.Remove(filepath.Join(cfg.RaftLogDir(), name)); err != nil {
+				return nil, kvstore.ErrIOFrom("remove uncommitted raft log file", 0, err)
+			}
+			continue
+		}
+		seq, ok := parseRaftSeq(name)
+		if !ok {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			return nil, kvstore.ErrIOFrom("stat raft log file", 0, err)
+		}
+		segs = append(segs, raftSegment{seq: seq, path: cfg.RaftLogPath(seq), size: info.Size()})
+	}
+	sort.Slice(segs, func(i, j int) bool { return segs[i].seq < segs[j].seq })
+	return segs, nil
+}
+
+func parseRaftSeq(name string) (uint64, bool) {
+	if len(name) != len("00000001.rlog") || filepath.Ext(name) != ".rlog" {
+		return 0, false
+	}
+	var seq uint64
+	if _, err := fmt.Sscanf(name[:8], "%08d", &seq); err != nil || seq == 0 {
+		return 0, false
+	}
+	return seq, true
+}
+
+// createRaftSegment 用「临时名 + rename」建段：崩溃只可能落在创建与改名之间，
+// 遗留的空临时文件由 listRaftSegments 删掉（D13、D15）。
+func createRaftSegment(cfg Config, seq uint64) (*os.File, error) {
+	tmp := cfg.RaftLogTmpPath(seq)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, kvstore.ErrIOFrom("create raft log file", 0, err)
+	}
+	if err := os.Rename(tmp, cfg.RaftLogPath(seq)); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return nil, kvstore.ErrIOFrom("rename raft log file", 0, err)
+	}
+	return f, nil
+}
+
+// scanRaftLog 逐文件逐条读回，第一条坏记录起裁剪并停止；它之后的正常记录一并丢弃（2.1 §5 的口径）。
+// index 不连续判 ErrStateMismatch：raft 日志中间有洞就意味着复制逻辑已经错了，裁剪只会把错藏起来。
+func scanRaftLog(cfg Config, lg *zap.Logger) ([]*raftEntry, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	segs, err := listRaftSegments(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]*raftEntry, 0, 64)
+	next := firstRaftIndex
+	for i, seg := range segs {
+		entries, cut, corrupt, err := replayRaftSegment(seg, lg)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			if e.index != next {
+				return nil, ErrStateMismatchAt(e.index,
+					fmt.Sprintf("raft log has a hole: index %d follows %d", e.index, next-1))
+			}
+			next++
+		}
+		out = append(out, entries...)
+		if !corrupt {
+			continue
+		}
+
+		// 已确认后面的段不可达：本段截到坏记录起点，其后各段清空。
+		// 下一次重启不再重复裁剪，坏尾也不会永远留在盘上。
+		if err := truncateRaftFile(seg.path, cut); err != nil {
+			return nil, err
+		}
+		for _, later := range segs[i+1:] {
+			if err := truncateRaftFile(later.path, 0); err != nil {
+				return nil, err
+			}
+		}
+		lg.Warn("raft log truncated",
+			zap.String("file", seg.path),
+			zap.Int64("offset", cut),
+			zap.Int64("truncated_bytes", seg.size-cut))
+		break
+	}
+	return out, nil
+}
+
+// replayRaftSegment 重放一个段，返回读成功的条目、裁剪起点与该段是否损坏。
+// 判定顺序按 3.1 §5：剩余不足 8B、len 越界、读不满 entry、crc 不符、op 非法。
+func replayRaftSegment(seg raftSegment, lg *zap.Logger) ([]*raftEntry, int64, bool, error) {
+	f, err := os.OpenFile(seg.path, os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, 0, false, kvstore.ErrIOFrom("open raft log for recovery", 0, err)
+	}
+	defer f.Close()
+
+	r := bufio.NewReader(f)
+	var (
+		out    []*raftEntry
+		offset int64
+	)
+	for offset < seg.size {
+		head := make([]byte, kvstore.FrameHeaderSize)
+		n, err := io.ReadFull(r, head)
+		if err != nil {
+			// 只剩几字节的帧头，含只有 len 没有 crc：都算坏尾起点。
+			lg.Warn("corrupt record tail", raftCorruptFields(seg.path, offset, kvstore.FrameHeaderSize, int64(n), "incomplete header")...)
+			return out, offset, true, nil
+		}
+		size, checksum, err := kvstore.DecodeFrame(head, offset)
+		if err != nil {
+			lg.Warn("corrupt record tail", raftCorruptFields(seg.path, offset, int64(size), 0, err.Error())...)
+			return out, offset, true, nil
+		}
+
+		entry := make([]byte, size)
+		n, err = io.ReadFull(r, entry)
+		if err != nil {
+			lg.Warn("corrupt record tail", raftCorruptFields(seg.path, offset, int64(size), int64(n), "entry shorter than declared length")...)
+			return out, offset, true, nil
+		}
+		if err := kvstore.CheckFrame(size, checksum, entry, offset); err != nil {
+			lg.Warn("corrupt record tail", raftCorruptFields(seg.path, offset, int64(size), int64(size), err.Error())...)
+			return out, offset, true, nil
+		}
+
+		term, index, command, err := decodeRaftEntry(entry, offset)
+		if err != nil {
+			lg.Warn("corrupt record tail", raftCorruptFields(seg.path, offset, int64(size), int64(size), err.Error())...)
+			return out, offset, true, nil
+		}
+		out = append(out, &raftEntry{
+			term:   term,
+			index:  index,
+			cmd:    append([]byte(nil), command...),
+			seq:    seg.seq,
+			offset: offset,
+			size:   int64(kvstore.FrameHeaderSize) + int64(size),
+		})
+		offset += int64(kvstore.FrameHeaderSize) + int64(size)
+	}
+	return out, 0, false, nil
+}
+
+// raftCorruptFields 与 2.1 §8 的损坏记录字段同款（3.1 §10 末行）。
+func raftCorruptFields(file string, offset, expectLen, gotLen int64, reason string) []zap.Field {
+	return []zap.Field{
+		zap.String("file", file),
+		zap.Int64("offset", offset),
+		zap.Int64("expect_len", expectLen),
+		zap.Int64("got_len", gotLen),
+		zap.String("reason", reason),
+	}
+}
+
+// truncateRaftFile 把文件截到 size 并单独落一次盘：截断本身也是复制出去过的边界。
+func truncateRaftFile(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		return kvstore.ErrIOFrom("open raft log for truncate", size, err)
+	}
+	if err := f.Truncate(size); err != nil {
+		_ = f.Close()
+		return kvstore.ErrIOFrom("truncate raft log file", size, err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return kvstore.ErrIOFrom("fsync raft log file", size, err)
+	}
+	if err := f.Close(); err != nil {
+		return kvstore.ErrIOFrom("close raft log file", size, err)
+	}
+	return nil
+}

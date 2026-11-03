@@ -1,0 +1,348 @@
+package raft
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/TheWor1d877/mini-Raft-KV/internal/kvstore"
+)
+
+// 四条路径共用一个端口：客户端与 RPC 打在同一个监听地址上（3.1 §4、D11）。
+const (
+	routeRequestVote   = "/raft/request-vote"
+	routeAppendEntries = "/raft/append-entries"
+	routePut           = "/put"
+	routeGet           = "/get"
+
+	// 一轮 AppendEntries 最多 64 条、每条命令的上限是 2.1 的 MaxEntrySize，
+	// 请求体的天花板按这两个值相乘再留一帧的余量；回执是小对象。
+	maxRPCBodyBytes   = int64(maxAppendEntries)*kvstore.MaxEntrySize + (1 << 20)
+	maxReplyBodyBytes = int64(1 << 20)
+
+	// 对端非 200 时只读这么多个字节进错误文本：那是给人看的线索，不是载荷。
+	maxErrorBodyBytes = 512
+)
+
+// httpTransport 是 Transport 的真实现：一条 RPC 一个 POST，JSON 编解码（D18）。
+// 超时取 min(2×-tick-ms, -election-timeout-ms)（3.1 §9）：RPC 在 Tick() 里串行发出，
+// 单个死节点占的时间必须远小于选举窗口，否则一轮投票会被四个超时之和拖过 T。
+type httpTransport struct {
+	client *http.Client
+}
+
+// NewTransport 给入口层用；单测里的内存夹具实现的是同一个接口，两边调的是同一批处理函数（3.1 §4）。
+func NewTransport(cfg Config) Transport {
+	return &httpTransport{client: &http.Client{Timeout: cfg.rpcTimeout()}}
+}
+
+func (t *httpTransport) RequestVote(to string, req VoteRequest) (VoteReply, error) {
+	var reply VoteReply
+	if err := t.post(to, routeRequestVote, req, &reply); err != nil {
+		return VoteReply{}, err
+	}
+	return reply, nil
+}
+
+func (t *httpTransport) AppendEntries(to string, req AppendRequest) (AppendReply, error) {
+	// 空数组是心跳的线上形状：nil 会被编码成 null，而 §4 的形状表写的是 entries=[]。
+	if req.Entries == nil {
+		req.Entries = []LogEntry{}
+	}
+	var reply AppendReply
+	if err := t.post(to, routeAppendEntries, req, &reply); err != nil {
+		return AppendReply{}, err
+	}
+	return reply, nil
+}
+
+// post 发一条 RPC。连不上、超时、状态码不是 200 都只回一个错误，
+// 上层把这视为一次失败、不重试（D23）。
+func (t *httpTransport) post(addr, route string, body, out any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return kvstore.ErrIOFrom("encode "+route+" request", 0, err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+route, bytes.NewReader(payload))
+	if err != nil {
+		return kvstore.ErrIOFrom("build "+route+" request", 0, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return kvstore.ErrIOFrom("send "+route+" to "+addr, 0, err)
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxReplyBodyBytes))
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		return fmt.Errorf("%s on %s answered %d: %s: %w",
+			route, addr, resp.StatusCode, bytes.TrimSpace(detail), kvstore.ErrIO)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReplyBodyBytes)).Decode(out); err != nil {
+		return kvstore.ErrIOFrom("decode "+route+" reply from "+addr, 0, err)
+	}
+	return nil
+}
+
+// nodeHandler 把四条路径接在同一个 Node 上：两个 RPC 走的就是内存夹具调的那批未导出处理函数，
+// /put 与 /get 走客户端路径。角色判断、复制、提交全在 Node 里，这里只做校验、映射与 req_id（D10）。
+type nodeHandler struct {
+	n  *Node
+	lg *zap.Logger
+
+	// 进程内自增，保证同一份日志里 req_id 不重复；跨进程靠各自的日志文件分开（2.1 §8）。
+	seq      atomic.Uint64
+	quit     func()
+	quitting atomic.Bool
+}
+
+// NewHandler 起 HTTP 入口。onWriteDisabled 在写路径永久关闭后被调用一次，
+// 由入口层结束进程（D5，与 2.1 §4 的退出码一档）。
+func NewHandler(n *Node, lg *zap.Logger, onWriteDisabled func()) http.Handler {
+	return &nodeHandler{
+		n:    n,
+		lg:   kvstore.WithComponent(lg, ComponentRaft).With(zap.String("node_id", n.cfg.NodeID)),
+		quit: onWriteDisabled,
+	}
+}
+
+func (h *nodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	reqID := "req-" + strconv.FormatUint(h.seq.Add(1), 10)
+
+	switch {
+	case r.URL.Path == routeRequestVote && r.Method == http.MethodPost:
+		h.handleVote(w, r, reqID, start)
+	case r.URL.Path == routeAppendEntries && r.Method == http.MethodPost:
+		h.handleAppend(w, r, reqID, start)
+	case r.URL.Path == routePut && r.Method == http.MethodPost:
+		h.handlePut(w, r, reqID, start)
+	case r.URL.Path == routeGet && r.Method == http.MethodGet:
+		h.handleGet(w, r, reqID, start)
+	case h.isKnownRoute(r.URL.Path):
+		h.fail(w, r.URL.Path, reqID, http.StatusMethodNotAllowed,
+			"method_not_allowed", "routes are POST /raft/request-vote, POST /raft/append-entries, POST /put and GET /get", 0, start)
+	default:
+		h.fail(w, r.URL.Path, reqID, http.StatusNotFound,
+			"not_found", "unknown route", 0, start)
+	}
+}
+
+func (h *nodeHandler) isKnownRoute(path string) bool {
+	switch path {
+	case routeRequestVote, routeAppendEntries, routePut, routeGet:
+		return true
+	default:
+		return false
+	}
+}
+
+// handleVote 与 handleAppend 只搬运：解出请求体，交给 Node 的那五步／六步，把回执原样写回去。
+// 回执的形状是 §4 的两个 reply 结构，不带 req_id——那是客户端那两条路径的字段。
+func (h *nodeHandler) handleVote(w http.ResponseWriter, r *http.Request, reqID string, start time.Time) {
+	var req VoteRequest
+	if err := decodeOne(r, maxRPCBodyBytes, voteFields, &req); err != nil {
+		h.badBody(w, routeRequestVote, reqID, err, start)
+		return
+	}
+	h.reply(w, routeRequestVote, reqID, h.n.handleRequestVote(req), start)
+}
+
+func (h *nodeHandler) handleAppend(w http.ResponseWriter, r *http.Request, reqID string, start time.Time) {
+	var req AppendRequest
+	if err := decodeOne(r, maxRPCBodyBytes, appendFields, &req); err != nil {
+		h.badBody(w, routeAppendEntries, reqID, err, start)
+		return
+	}
+	h.reply(w, routeAppendEntries, reqID, h.n.handleAppendEntries(req), start)
+}
+
+type putRequest struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type putResponse struct {
+	OK    bool   `json:"ok"`
+	ReqID string `json:"req_id"`
+	Index uint64 `json:"index"`
+	Term  uint64 `json:"term"`
+}
+
+type getResponse struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	ReqID string `json:"req_id"`
+}
+
+// errorResponse 的形状沿用 2.1 §4：error 给人看，code 给机器判，offset 指向坏记录的字节位置。
+// 两个 leader 字段只在 not_leader 那一格出现，其余错误里连键都不写。
+type errorResponse struct {
+	Error  string `json:"error"`
+	Code   string `json:"code"`
+	ReqID  string `json:"req_id"`
+	Offset int64  `json:"offset,omitempty"`
+}
+
+// notLeaderResponse 只在 /put 的 503 上用：两个 leader 提示不带 omitempty，
+// 没听说过 Leader 时回空串，键仍在（3.1 §4「五个键固定」）。
+type notLeaderResponse struct {
+	Error      string `json:"error"`
+	Code       string `json:"code"`
+	ReqID      string `json:"req_id"`
+	LeaderID   string `json:"leader_id"`
+	LeaderAddr string `json:"leader_addr"`
+}
+
+// 三条 POST 路径各自的必填字段：缺一个就是 400，不能让一个字段都不带的请求
+// 静默退化成「term 0 的心跳」——RPC 的每个字段都参与状态机判定（3.1 §4）。
+var (
+	voteFields   = []string{"term", "candidateId", "lastLogIndex", "lastLogTerm"}
+	appendFields = []string{"term", "leaderId", "prevLogIndex", "prevLogTerm", "entries", "leaderCommit"}
+	putFields    = []string{"key", "value"}
+)
+
+func (h *nodeHandler) handlePut(w http.ResponseWriter, r *http.Request, reqID string, start time.Time) {
+	var body putRequest
+	if err := decodeOne(r, kvstore.MaxEntrySize, putFields, &body); err != nil {
+		h.badBody(w, routePut, reqID, err, start)
+		return
+	}
+
+	ctx := kvstore.WithRequestID(r.Context(), reqID)
+	index, term, err := h.n.Propose(ctx, body.Key, body.Value)
+	if err != nil {
+		if errors.Is(err, ErrNotLeader) {
+			h.notLeader(w, reqID, err, start)
+			return
+		}
+		if errors.Is(err, kvstore.ErrIO) && h.n.writeDisabled() && h.quitting.CompareAndSwap(false, true) {
+			// D5：raft 日志的写路径已经永久关闭，进程留着只会继续返回错误，交给入口层退出。
+			h.lg.Error("write path disabled, exiting", zap.String("req_id", reqID))
+			if h.quit != nil {
+				go h.quit()
+			}
+		}
+		h.failWithError(w, routePut, reqID, err, start)
+		return
+	}
+	h.ok(w, routePut, reqID, putResponse{OK: true, ReqID: reqID, Index: index, Term: term}, start)
+}
+
+func (h *nodeHandler) handleGet(w http.ResponseWriter, r *http.Request, reqID string, start time.Time) {
+	if !r.URL.Query().Has("key") {
+		h.fail(w, routeGet, reqID, http.StatusBadRequest,
+			"bad_request", "query parameter key is required", 0, start)
+		return
+	}
+	value, err := h.n.Get(r.URL.Query().Get("key"))
+	if err != nil {
+		h.failWithError(w, routeGet, reqID, err, start)
+		return
+	}
+	h.ok(w, routeGet, reqID, getResponse{Key: r.URL.Query().Get("key"), Value: value, ReqID: reqID}, start)
+}
+
+// decodeOne 收一条请求体：超限、非法 JSON、缺字段、把多条写塞进一个请求都在这一步挡住（2.1 §4 同口径）。
+// 整读一次再解两次：先解成字段集合查必填，再解进结构体。
+func decodeOne(r *http.Request, limit int64, required []string, out any) error {
+	raw, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, limit))
+	if err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	for _, key := range required {
+		if _, ok := fields[key]; !ok {
+			return fmt.Errorf("field %q is required", key)
+		}
+	}
+	return json.Unmarshal(raw, out)
+}
+
+func (h *nodeHandler) badBody(w http.ResponseWriter, route, reqID string, err error, start time.Time) {
+	var over *http.MaxBytesError
+	if errors.As(err, &over) {
+		h.fail(w, route, reqID, http.StatusRequestEntityTooLarge,
+			"too_large", "request body over the entry limit", 0, start)
+		return
+	}
+	h.fail(w, route, reqID, http.StatusBadRequest,
+		"bad_request", "body must be one JSON object: "+err.Error(), 0, start)
+}
+
+// notLeader 是 /put 在非 Leader 上的那一格：503 带 leader 提示，客户端按提示改投（3.1 §4）。
+// 这个节点没听说过 Leader 时两个字段留空，形状不变。
+func (h *nodeHandler) notLeader(w http.ResponseWriter, reqID string, err error, start time.Time) {
+	id, addr, ok := h.n.Leader()
+	if !ok {
+		id, addr = "", ""
+	}
+	h.lg.Warn("http request failed",
+		zap.String("req_id", reqID),
+		zap.String("route", routePut),
+		zap.Int("status", http.StatusServiceUnavailable),
+		zap.String("code", "not_leader"),
+		zap.String("leader_id", id),
+		zap.Int64("duration_ms", time.Since(start).Milliseconds()))
+	writeJSON(w, http.StatusServiceUnavailable, notLeaderResponse{
+		Error: err.Error(), Code: "not_leader", ReqID: reqID, LeaderID: id, LeaderAddr: addr,
+	})
+}
+
+func (h *nodeHandler) failWithError(w http.ResponseWriter, route, reqID string, err error, start time.Time) {
+	status, code := statusFor(err)
+	offset, _ := kvstore.CorruptOffset(err)
+	h.fail(w, route, reqID, status, code, err.Error(), offset, start)
+}
+
+func (h *nodeHandler) fail(w http.ResponseWriter, route, reqID string, status int, code, detail string, offset int64, start time.Time) {
+	h.lg.Warn("http request failed",
+		zap.String("req_id", reqID),
+		zap.String("route", route),
+		zap.Int("status", status),
+		zap.String("code", code),
+		zap.Int64("duration_ms", time.Since(start).Milliseconds()))
+	writeJSON(w, status, errorResponse{Error: detail, Code: code, ReqID: reqID, Offset: offset})
+}
+
+// ok 是客户端那两条路径的成功回执：响应体自己带 req_id。
+func (h *nodeHandler) ok(w http.ResponseWriter, route, reqID string, payload any, start time.Time) {
+	h.lg.Debug("http request served",
+		zap.String("req_id", reqID),
+		zap.String("route", route),
+		zap.Int("status", http.StatusOK),
+		zap.Int64("duration_ms", time.Since(start).Milliseconds()))
+	writeJSON(w, http.StatusOK, payload)
+}
+
+// reply 是 RPC 两条路径的成功回执：写出去的是 §4 的 reply 结构本身，字段一个不多。
+func (h *nodeHandler) reply(w http.ResponseWriter, route, reqID string, payload any, start time.Time) {
+	h.lg.Debug("rpc request served",
+		zap.String("req_id", reqID),
+		zap.String("route", route),
+		zap.Int("status", http.StatusOK),
+		zap.Int64("duration_ms", time.Since(start).Milliseconds()))
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	// 响应已经写了头，编码失败只能截断在这一条上，没有别的兜底位置（2.1 §4 同款）。
+	_ = json.NewEncoder(w).Encode(payload)
+}
