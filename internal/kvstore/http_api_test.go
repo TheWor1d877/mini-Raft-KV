@@ -21,6 +21,21 @@ type httpFixture struct {
 	srv     *httptest.Server
 	records *observer.ObservedLogs
 	quit    atomic.Int64
+	// bodyRead 数服务端从请求体里真正读走的字节。客户端一侧的读数没有上界：
+	// 体被写进 socket 缓冲就算「读走」了，多少能塞进去由调度决定，判据落不到那一边。
+	bodyRead atomic.Int64
+}
+
+// countedBody 把每一次读的字节数记进读数的表。
+type countedBody struct {
+	io.ReadCloser
+	n *atomic.Int64
+}
+
+func (c countedBody) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	c.n.Add(int64(n))
+	return n, err
 }
 
 func newHTTPFixture(t *testing.T, cfg Config) *httpFixture {
@@ -31,7 +46,11 @@ func newHTTPFixture(t *testing.T, cfg Config) *httpFixture {
 		t.Fatalf("Open = %v", err)
 	}
 	f := &httpFixture{k: k, records: records}
-	f.srv = httptest.NewServer(NewHTTPHandler(k, lg, func() { f.quit.Add(1) }))
+	h := NewHTTPHandler(k, lg, func() { f.quit.Add(1) })
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = countedBody{ReadCloser: r.Body, n: &f.bodyRead}
+		h.ServeHTTP(w, r)
+	}))
 	t.Cleanup(f.srv.Close)
 	t.Cleanup(func() { _ = k.Close() })
 	return f
@@ -85,14 +104,13 @@ func (f *httpFixture) get(t *testing.T, key string) httpReply {
 	return f.request(t, http.MethodGet, "/get?key="+url.QueryEscape(key), nil)
 }
 
-// countingReader 吐无限个 'x'，同时记录服务端实际读走了多少字节。
-type countingReader struct{ pulled atomic.Int64 }
+// infiniteReader 吐无限个 'x'：这条请求体要多长由 io.LimitReader 说了算，不由它说了算。
+type infiniteReader struct{}
 
-func (r *countingReader) Read(p []byte) (int, error) {
+func (r infiniteReader) Read(p []byte) (int, error) {
 	for i := range p {
 		p[i] = 'x'
 	}
-	r.pulled.Add(int64(len(p)))
 	return len(p), nil
 }
 
@@ -243,16 +261,18 @@ func TestHTTPRejectsBadBodies(t *testing.T) {
 		t.Errorf("the oversized body reached the kv write path %d times", n)
 	}
 
-	// 永不收尾的超限请求体：读字节数被上限卡住，整份请求不会被拉进内存。
+	// 永不收尾的超限请求体：服务端读走的字节被上限卡住，整份请求不会被拉进内存。
 	// 这条比上一条更严——去掉体大小上限后，服务端会读完全部字节再报坏 JSON。
-	xs := &countingReader{}
-	unterminated := io.MultiReader(strings.NewReader(`{"key":"huge","value":"`), io.LimitReader(xs, 24<<20))
+	unterminated := io.MultiReader(strings.NewReader(`{"key":"huge","value":"`),
+		io.LimitReader(infiniteReader{}, 24<<20))
+	before := f.bodyRead.Load()
 	reply = f.request(t, http.MethodPost, "/put", unterminated)
 	if reply.status != http.StatusRequestEntityTooLarge || reply.string("code") != "too_large" {
 		t.Errorf("unterminated oversized body = %d %v, want 413 too_large", reply.status, reply.body)
 	}
-	if pulled := xs.pulled.Load(); pulled > MaxEntrySize+1<<22 {
-		t.Errorf("server pulled %d bytes from an oversized body, want at most %d", pulled, MaxEntrySize+1<<22)
+	// MaxBytesReader 的口径是最多读到上限再多一个字节就报错，所以 +1 是理论上界。
+	if pulled := f.bodyRead.Load() - before; pulled > MaxEntrySize+1 {
+		t.Errorf("the server read %d bytes from an oversized body, want at most %d", pulled, MaxEntrySize+1)
 	}
 
 	// 上面这些都不许动到已有状态。

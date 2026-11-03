@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ import (
 )
 
 // 退出码：0 收到 SIGINT/SIGTERM 正常收尾；1 打开数据目录失败、写路径失效或收尾出错；2 配置与日志起不来。
+// 窗口只用在途请求上，沉默连接在收尾开始时就被关掉（2.1 §4），所以不必比 net/http 内部那 5 秒更长。
 const shutdownGrace = 5 * time.Second
 
 func main() {
@@ -62,9 +64,24 @@ func run(args []string) int {
 		closeStore(k, entry)
 		return 1
 	}
+	// 收尾不等「连上了但没发出第一个请求头」的连接：net/http 把它们当忙连接，
+	// 要等各自满 5 秒才肯当空闲（Issue 22682），正好把整个收尾窗口烧光（2.1 §4）。
+	var silentMu sync.Mutex
+	silentConns := map[net.Conn]struct{}{}
+	// 一条连接只在 StateNew 待着的时候才算沉默；请求头一开始读就转 StateActive，之后由 Shutdown 管。
+	connState := func(c net.Conn, state http.ConnState) {
+		silentMu.Lock()
+		defer silentMu.Unlock()
+		if state == http.StateNew {
+			silentConns[c] = struct{}{}
+			return
+		}
+		delete(silentConns, c)
+	}
 	srv := &http.Server{
 		Handler:           kvstore.NewHTTPHandler(k, lg.Logger, quit),
 		ReadHeaderTimeout: 5 * time.Second,
+		ConnState:         connState,
 	}
 	entry.Info("server started",
 		zap.String("addr", ln.Addr().String()),
@@ -81,6 +98,18 @@ func run(args []string) int {
 			code = 1
 		}
 	case <-ctx.Done():
+	}
+
+	// 沉默连接先关掉：它们没有请求在途，留到 Shutdown 里只会占用收尾窗口。
+	silentMu.Lock()
+	silentCount := len(silentConns)
+	for c := range silentConns {
+		_ = c.Close()
+		delete(silentConns, c)
+	}
+	silentMu.Unlock()
+	if silentCount > 0 {
+		entry.Info("closed connections that never sent a request", zap.Int("count", silentCount))
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)

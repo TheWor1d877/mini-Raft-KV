@@ -92,8 +92,23 @@ type kvProcess struct {
 	cmd     *exec.Cmd
 	dataDir string
 	addr    string
+	logPath string
 	out     *bytes.Buffer
 	exited  bool
+}
+
+// 进程的日志只落文件、不落 stdout（2.1 §5），所以 cmd 的输出缓冲区在失败时恒为空。
+// 退出码 1 的原因（收尾超时、Close 失败、写路径失效）全在日志文件里，失败时必须把尾巴打出来。
+func (p *kvProcess) logTail(lines int) string {
+	data, err := os.ReadFile(p.logPath)
+	if err != nil {
+		return fmt.Sprintf("<read %s: %v>", p.logPath, err)
+	}
+	all := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+	if len(all) > lines {
+		all = all[len(all)-lines:]
+	}
+	return "\n" + string(bytes.Join(all, []byte("\n")))
 }
 
 // 起进程并等到 HTTP 可用。extra 传额外的命令行开关。
@@ -113,7 +128,8 @@ func startKVProcessAt(t *testing.T, dataDir, addr string, extra ...string) *kvPr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start miniraft-kv: %v", err)
 	}
-	p := &kvProcess{t: t, cmd: cmd, dataDir: dataDir, addr: addr, out: out}
+	p := &kvProcess{t: t, cmd: cmd, dataDir: dataDir, addr: addr,
+		logPath: filepath.Join(dataDir, LogDirName, LogFileName), out: out}
 	t.Cleanup(func() {
 		if !p.exited {
 			_ = p.cmd.Process.Kill()
@@ -135,7 +151,8 @@ func (p *kvProcess) waitReady() {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	p.t.Fatalf("miniraft-kv never served on %s\noutput:\n%s", p.addr, p.out.String())
+	p.t.Fatalf("miniraft-kv never served on %s\nstdout:\n%s\nlast log lines:%s",
+		p.addr, p.out.String(), p.logTail(20))
 }
 
 func (p *kvProcess) url(path string) string { return "http://" + p.addr + path }
@@ -194,21 +211,49 @@ func (p *kvProcess) kill9() {
 // SIGTERM：走优雅关闭，退出码必须是 0。
 func (p *kvProcess) terminateWantClean() {
 	p.t.Helper()
+	p.terminateWithin(10 * time.Second)
+}
+
+// terminateWithin 发 SIGTERM，核对退出码，并给「信号到进程退出」设上限 limit。
+// 时长这条是收尾窗口的判据：沉默连接在场时，旧实现要等满 Go 内部那 5 秒才脱身，
+// 只看退出码的话把窗口调大照样能过（2.1 §4）。
+func (p *kvProcess) terminateWithin(limit time.Duration) {
+	p.t.Helper()
 	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		p.t.Fatalf("sigterm: %v", err)
 	}
 	done := make(chan error, 1)
 	go func() { done <- p.cmd.Wait() }()
+	start := time.Now()
 	select {
 	case err := <-done:
 		p.exited = true
+		elapsed := time.Since(start)
 		if err != nil {
-			p.t.Fatalf("graceful shutdown exited with %v, want 0\noutput:\n%s", err, p.out.String())
+			p.t.Fatalf("graceful shutdown exited with %v after %s, want 0\nstdout:\n%s\nlast log lines:%s",
+				err, elapsed, p.out.String(), p.logTail(20))
+		}
+		if elapsed > limit {
+			p.t.Fatalf("graceful shutdown took %s, over the %s limit\nstdout:\n%s\nlast log lines:%s",
+				elapsed, limit, p.out.String(), p.logTail(20))
 		}
 	case <-time.After(10 * time.Second):
 		_ = p.cmd.Process.Kill()
-		p.t.Fatalf("no clean exit within 10s after SIGTERM\noutput:\n%s", p.out.String())
+		p.t.Fatalf("no clean exit within 10s after SIGTERM\nstdout:\n%s\nlast log lines:%s",
+			p.out.String(), p.logTail(20))
 	}
+}
+
+// openSilentConn 连上端口但一个字节都不发：服务端这条连接停在 StateNew，
+// 也就是「已经受理、还没读到请求头」那一类（2.1 §4）。
+func (p *kvProcess) openSilentConn() net.Conn {
+	p.t.Helper()
+	c, err := net.Dial("tcp", p.addr)
+	if err != nil {
+		p.t.Fatalf("dial %s: %v", p.addr, err)
+	}
+	p.t.Cleanup(func() { _ = c.Close() })
+	return c
 }
 
 // writeRange 写入 n 条互不相同的 key，返回服务端确认成功（2xx）的条数。
@@ -424,6 +469,43 @@ func TestGracefulShutdownLosesNothing(t *testing.T) {
 	if n := strings.Count(log, `"msg":"http request served"`); n != total*2 {
 		t.Errorf("access log has %d lines, want %d (one per request to this process)", n, total*2)
 	}
+}
+
+// 只连不说话的连接占不住收尾窗口（2.1 §4）：net/http 把这种连接当忙连接，
+// 要等它自己满 5 秒才肯当空闲，旧实现里这 5 秒和 shutdownGrace 撞在同一时刻，
+// 于是 Shutdown 返回 context deadline exceeded、进程退 1，而数据一条没丢。
+func TestSilentConnectionDoesNotBlockShutdown(t *testing.T) {
+	skipProcessTest(t)
+	const total = 20
+	dataDir := t.TempDir()
+
+	p := startKVProcess(t, dataDir)
+	if p.writeRange(total) != total {
+		t.Fatalf("setup writes were not all acked")
+	}
+	p.openSilentConn()
+	// 沉默连接光 dial 不算被受理：accept 循环按顺序收连接，所以让它随后服务一次全新拨号即可反证。
+	// keep-alive 必须关掉，否则这次请求可能复用旧连接，顺序就落不到 accept 上。
+	noKeep := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := noKeep.Get(p.url("/get?key=probe"))
+	if err != nil {
+		t.Fatalf("get after the silent dial: %v", err)
+	}
+	resp.Body.Close()
+	noKeep.CloseIdleConnections()
+
+	p.terminateWithin(4 * time.Second)
+
+	// 这条日志说明收尾确实关掉了沉默连接。条数不钉死：本用例自己的客户端也会留下受理完还没读的连接。
+	if !strings.Contains(processLog(t, dataDir), `"msg":"closed connections that never sent a request"`) {
+		t.Errorf("shutdown did not close any silent connection\nlast log lines:%s", p.logTail(6))
+	}
+
+	restarted := startKVProcess(t, dataDir)
+	if got := restarted.reconcile(total); got != total {
+		t.Errorf("after a shutdown with a silent connection, %d of %d records came back", got, total)
+	}
+	restarted.terminateWantClean()
 }
 
 func processLog(t *testing.T, dataDir string) string {
