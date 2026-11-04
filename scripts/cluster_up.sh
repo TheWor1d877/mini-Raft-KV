@@ -59,9 +59,10 @@ for ((i = 1; i <= NODES; i++)); do
 	id="node-$i"
 	addr="127.0.0.1:$((PORT0 + i - 1))"
 	dir="$ROOT_DATA/$id"
-	mkdir -p "$dir"
-	# 节点的日志全在文件里，stdout 必须丢掉：它们留着管道口，调用方的 `| tail` 之类的就永远等不到 EOF。
-	"$BIN" -node-id "$id" -peers "$PEERS" -data-dir "$dir" -log-level "$LEVEL" >/dev/null 2>&1 &
+	mkdir -p "$dir/log"
+	# 节点的运行日志全在 miniraft-node.log 里，stdout 必须丢掉：留着管道口，调用方的 `| tail` 之类的就永远等不到 EOF。
+	# stderr 单独收进 log/stderr.txt：panic 和 Go runtime 的 fatal 只走 stderr，丢了就没有现场。
+	"$BIN" -node-id "$id" -peers "$PEERS" -data-dir "$dir" -log-level "$LEVEL" >/dev/null 2>>"$dir/log/stderr.txt" &
 	pid=$!
 	if ! wait_ready "$addr" "$dir"; then
 		# 已经起来的节点留在这儿，清单里也留着：排查完用同一条 cluster_down.sh 收。

@@ -218,7 +218,11 @@ func TestClusterHealOverwritesStaleLeaderSuffix(t *testing.T) {
 	c.partition(minority, majority)
 	// 只推多数派那半：它选出一个更高 term 的新 Leader，少数派留在旧 term 上不动。
 	c.tick(60, majority...)
-	newID := c.leaders(majority...)[0]
+	newIDs := c.leaders(majority...)
+	if len(newIDs) != 1 {
+		t.Fatalf("majority leaders after the heal = %v, want exactly one: cluster = %v", newIDs, c.dump())
+	}
+	newID := newIDs[0]
 
 	// 旧 Leader 独走：本地收下一条写，少数派凑不齐多数派，ctx 取消之后 Propose 判负。
 	ctx, cancel := context.WithCancel(context.Background())
