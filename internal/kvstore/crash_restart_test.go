@@ -400,15 +400,15 @@ func readRaftState(t *testing.T, dataDir string) raftStateDoc {
 	return st
 }
 
-func raftSegments(t *testing.T, dataDir string) []string {
+func walSegments(t *testing.T, dataDir string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dataDir, "raft", "log"))
+	entries, err := os.ReadDir(filepath.Join(dataDir, "raft", "wal"))
 	if err != nil {
-		t.Fatalf("read raft/log: %v", err)
+		t.Fatalf("read raft/wal: %v", err)
 	}
 	var out []string
 	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".rlog") {
+		if strings.HasSuffix(e.Name(), ".wal") {
 			out = append(out, e.Name())
 		}
 	}
@@ -416,7 +416,7 @@ func raftSegments(t *testing.T, dataDir string) []string {
 }
 
 // kill -9 之后已确认的写一条不少：写路径每条一次 Sync，旧「批次未满丢 0..63 条」的
-// D6 窗口不复存在（docs/8 §二）。同时钉住目录布局：没有 wal/、raft/log 有段、
+// D6 窗口不复存在（docs/8 §二）。同时钉住目录布局：顶层没有 wal/、raft/wal 有段、
 // raft/state 的 lastApplied 不小于确认过的条数。
 func TestCrashAfterAckedWritesLosesNothing(t *testing.T) {
 	skipProcessTest(t)
@@ -437,8 +437,8 @@ func TestCrashAfterAckedWritesLosesNothing(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dataDir, "wal")); !os.IsNotExist(err) {
 		t.Errorf("a wal/ directory exists in %s: KV WAL was retired (docs/8 §二)", dataDir)
 	}
-	if got := raftSegments(t, dataDir); len(got) == 0 {
-		t.Error("no .rlog segment under raft/log after 200 acked writes")
+	if got := walSegments(t, dataDir); len(got) == 0 {
+		t.Error("no .wal segment under raft/wal after 200 acked writes")
 	}
 	st := readRaftState(t, dataDir)
 	if st.LastApplied < acked {
@@ -528,28 +528,28 @@ func TestSilentConnectionDoesNotBlockShutdown(t *testing.T) {
 	restarted.terminateWantClean()
 }
 
-// 建新段被权限挡住时，进程只回 500，不自杀：raftLog 的失效只由 Sync 失败触发，
+// 建新段被权限挡住时，进程只回 500，不自杀：wal 的失效只由 Sync 失败触发，
 // 建段失败不置失效（3.1 §7）。读路径继续服务，恢复写权限后追加照常（D5 新口径）。
 func TestProcessSurvivesBlockedSegmentCreation(t *testing.T) {
 	skipProcessTest(t)
 	dataDir := t.TempDir()
-	raftLogDir := filepath.Join(dataDir, "raft", "log")
+	walDir := filepath.Join(dataDir, "raft", "wal")
 	// 一条 ("kNNNN","vNNNN") 记录 52B 帧：128B 的段上限让每隔两条滚一次段。
 	p := startKVProcess(t, dataDir, "-max-file-size", "128")
 
 	const total = 10
 	p.writeRange(total)
-	if got := len(raftSegments(t, dataDir)); got < 2 {
+	if got := len(walSegments(t, dataDir)); got < 2 {
 		t.Fatalf("setup wrote %d segments under a 128-byte cap, want rollover to have happened", got)
 	}
 
-	if err := os.Chmod(raftLogDir, 0o555); err != nil {
-		t.Fatalf("chmod raft log dir: %v", err)
+	if err := os.Chmod(walDir, 0o555); err != nil {
+		t.Fatalf("chmod wal dir: %v", err)
 	}
 	restored := false
 	restore := func() {
 		if !restored {
-			if err := os.Chmod(raftLogDir, 0o755); err != nil {
+			if err := os.Chmod(walDir, 0o755); err != nil {
 				t.Fatalf("restore chmod: %v", err)
 			}
 			restored = true
@@ -578,7 +578,7 @@ func TestProcessSurvivesBlockedSegmentCreation(t *testing.T) {
 		t.Fatalf("put %s during a blocked rollover = %d, want 200 or 500", key, code)
 	}
 	if rejectedKey == "" {
-		t.Fatalf("12 puts against a 555-mode raft log dir never forced a rollover")
+		t.Fatalf("12 puts against a 555-mode wal dir never forced a rollover")
 	}
 
 	// 读路径必须还活着，而且是默认档线性一致读：进程没被这条 500 带走。

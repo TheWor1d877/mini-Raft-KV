@@ -322,9 +322,9 @@ func (c *cluster) reseed(id string, st State, entries []seedEntry) *Node {
 	if err := newStateFile(c.raftCfg[id], zap.NewNop()).store(st); err != nil {
 		c.t.Fatalf("seed state for %s: %v", id, err)
 	}
-	l, err := openRaftLog(c.raftCfg[id], zap.NewNop())
+	l, err := openWAL(c.raftCfg[id], zap.NewNop())
 	if err != nil {
-		c.t.Fatalf("open raft log for %s: %v", id, err)
+		c.t.Fatalf("open wal for %s: %v", id, err)
 	}
 	for _, e := range entries {
 		mustAppend(c.t, l, e.term, e.index, e.cmd)

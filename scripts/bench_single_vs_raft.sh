@@ -16,9 +16,9 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# 目录名与扩展名各收在这里：step 4 改名（raft/log→raft/wal、.rlog→.wal）只动下面两行。
-SEG_DIR_REL="raft/log"
-SEG_EXT="rlog"
+# 目录名与扩展名各收在这里：一份日志只有这一处口径（docs/8 §二）。
+SEG_DIR_REL="raft/wal"
+SEG_EXT="wal"
 # 进程日志与 stderr 的落点只有这一处口径（3.1 §6 末段：一个进程一份 miniraft-node.log）。
 LOG_DIR_REL="log"
 LOG_REL="$LOG_DIR_REL/miniraft-node.log"
@@ -179,22 +179,22 @@ stop_all() {
 	KV_PID=""
 }
 
-report() { # $1 = mode，$2 = json，$3 = wal 字节（KV WAL 取消后三档恒传 0，列位留着给 step 4），$4 = raft 日志字节
+report() { # $1 = mode，$2 = json，$3 = 这一档 Leader 的 WAL 字节
 	local acked elapsed ops p50 p99
 	acked="$(printf '%s' "$2" | jq -r .acked)"
 	elapsed="$(printf '%s' "$2" | jq -r .elapsed_ms)"
 	ops="$(printf '%s' "$2" | jq -r .ops_per_sec)"
 	p50="$(printf '%s' "$2" | jq -r .p50_ms)"
 	p99="$(printf '%s' "$2" | jq -r .p99_ms)"
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$N" "$acked" "$elapsed" "$ops" "$p50" "$p99" "$3" "$4"
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$N" "$acked" "$elapsed" "$ops" "$p50" "$p99" "$3"
 	if [[ "$(printf '%s' "$2" | jq -r '.failed | length')" != "0" ]]; then
 		echo "  $1 档有非 200 响应：$(printf '%s' "$2" | jq -c .failed)（acked $acked / $N）" >&2
 	fi
 }
 
 # 这一档的日志落了多少字节：段目录里没有 *.$SEG_EXT 就是没落盘，算跑失败。
-# KV WAL 与它的批次开关（-batch-size、-fsync）随合并一起取消，所以 wal_bytes 这一栏三档都回 0，
-# 全部日志字节记在 raftlog_bytes；step 4 把 raft/log 改名成 raft/wal 之后这一栏的归属再跟着改。
+# KV WAL 与它的批次开关（-batch-size、-fsync）随合并一起取消，wal_bytes 从此只有一栏：
+# 合并后的日志就是 raft/wal，旧口径里 wal_bytes（KV WAL）与 raftlog_bytes（raft 日志）两栏并成一栏。
 seg_bytes() { # $1 = 节点数据目录
 	local dir="$1" n
 	n="$(find "$dir/$SEG_DIR_REL" -name "*.$SEG_EXT" 2>/dev/null | wc -l | tr -d ' ')"
@@ -206,7 +206,7 @@ seg_bytes() { # $1 = 节点数据目录
 }
 
 main() {
-	local b mode fsync_flag out raftlog_bytes payload_dir KV_ADDR SINGLE_MODE
+	local b mode fsync_flag out wal_bytes payload_dir KV_ADDR SINGLE_MODE
 	# 这三个必须是全局：make_payloads／start_raft_cluster／report 都从全局取，
 	# 被 source 的 bench_read_modes.sh 用的也是同一套全局。
 	N="${1:-2000}"
@@ -224,7 +224,7 @@ main() {
 	payload_dir="$(mktemp -d)"
 	make_payloads "$payload_dir"
 
-	printf 'mode\twrites\tacked\telapsed_ms\tops_per_sec\tp50_ms\tp99_ms\twal_bytes\traftlog_bytes\n'
+	printf 'mode\twrites\tacked\telapsed_ms\tops_per_sec\tp50_ms\tp99_ms\twal_bytes\n'
 
 	# 档 1：单节点 raft 集群（bin/miniraft-kv 的进程载体），成员表只有自己，
 	# 自票当选后写路径每条一次 Sync。单节点档 -node-id 与 -peers 可省，只给 -addr。
@@ -241,8 +241,8 @@ main() {
 		exit 1
 	fi
 	out="$(run_client "$KV_ADDR" "$payload_dir")" || { echo "$SINGLE_MODE 档跑失败" >&2; stop_all; exit 1; }
-	raftlog_bytes="$(seg_bytes "$ROOT_DATA/$SINGLE_MODE")" || { stop_all; rm -rf "$payload_dir"; exit 1; }
-	report "$SINGLE_MODE" "$out" 0 "$raftlog_bytes"
+	wal_bytes="$(seg_bytes "$ROOT_DATA/$SINGLE_MODE")" || { stop_all; rm -rf "$payload_dir"; exit 1; }
+	report "$SINGLE_MODE" "$out" "$wal_bytes"
 	stop_all
 
 	# 档 2 与档 3：5 节点集群，端口段复用，数据目录各自一份。
@@ -259,8 +259,8 @@ main() {
 			exit 1
 		fi
 		out="$(run_client "$LEADER_ADDR" "$payload_dir")" || { echo "$mode 档跑失败（Leader $LEADER_ADDR）" >&2; stop_all; exit 1; }
-		raftlog_bytes="$(seg_bytes "$ROOT_DATA/$mode/$LEADER_ID")" || { stop_all; rm -rf "$payload_dir"; exit 1; }
-		report "$mode" "$out" 0 "$raftlog_bytes"
+		wal_bytes="$(seg_bytes "$ROOT_DATA/$mode/$LEADER_ID")" || { stop_all; rm -rf "$payload_dir"; exit 1; }
+		report "$mode" "$out" "$wal_bytes"
 		echo "  $mode 的 Leader 是 $LEADER_ID（$LEADER_ADDR），5 个节点各写一份 raft 日志" >&2
 		stop_all
 	done

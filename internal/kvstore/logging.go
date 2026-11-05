@@ -11,12 +11,12 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-// component 取值集合见 2.1 §8。
+// component 取值集合见 2.1 §8。合并之后 WAL 是唯一的日志部件：
+// 旧集合里的 recovery 与 raft 侧的 raftlog 都收进 wal，一个部件一个值。
 const (
-	ComponentWAL      = "wal"
-	ComponentKV       = "kv"
-	ComponentRecovery = "recovery"
-	ComponentEntry    = "entry"
+	ComponentWAL   = "wal"
+	ComponentKV    = "kv"
+	ComponentEntry = "entry"
 )
 
 type Logger struct {

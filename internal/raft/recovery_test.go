@@ -94,7 +94,7 @@ func TestRecoveryRefusesToSkipAnUndecodableEntry(t *testing.T) {
 	}
 	cfg := c.raftCfg["node-1"]
 
-	l, err := openRaftLog(cfg, zap.NewNop())
+	l, err := openWAL(cfg, zap.NewNop())
 	if err != nil {
 		t.Fatalf("open the log: %v", err)
 	}

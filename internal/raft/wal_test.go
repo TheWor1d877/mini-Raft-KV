@@ -16,17 +16,17 @@ import (
 	"github.com/TheWor1d877/mini-Raft-KV/internal/kvstore"
 )
 
-func openTestRaftLog(t *testing.T, cfg Config) *raftLog {
+func openTestRaftLog(t *testing.T, cfg Config) *wal {
 	t.Helper()
-	l, err := openRaftLog(cfg, zap.NewNop())
+	l, err := openWAL(cfg, zap.NewNop())
 	if err != nil {
-		t.Fatalf("open raft log: %v", err)
+		t.Fatalf("open wal: %v", err)
 	}
 	t.Cleanup(func() { _ = l.close() })
 	return l
 }
 
-func mustAppend(t *testing.T, l *raftLog, term, index uint64, cmd string) *raftEntry {
+func mustAppend(t *testing.T, l *wal, term, index uint64, cmd string) *walEntry {
 	t.Helper()
 	e, err := l.appendEntry(term, index, []byte(cmd))
 	if err != nil {
@@ -38,7 +38,7 @@ func mustAppend(t *testing.T, l *raftLog, term, index uint64, cmd string) *raftE
 // raftFrame 按 3.1 §5 的口径手工组一条完整记录，用来伪造坏尾。
 func raftFrame(t *testing.T, term, index uint64, cmd string) []byte {
 	t.Helper()
-	frame, err := kvstore.EncodeFrame(encodeRaftEntry(term, index, []byte(cmd)))
+	frame, err := kvstore.EncodeFrame(encodeWALRecord(term, index, []byte(cmd)))
 	if err != nil {
 		t.Fatalf("encode frame: %v", err)
 	}
@@ -47,23 +47,23 @@ func raftFrame(t *testing.T, term, index uint64, cmd string) []byte {
 
 func plantRaftSegment(t *testing.T, cfg Config, seq uint64, data []byte) {
 	t.Helper()
-	if err := os.WriteFile(cfg.RaftLogPath(seq), data, 0o644); err != nil {
+	if err := os.WriteFile(cfg.WALPath(seq), data, 0o644); err != nil {
 		t.Fatalf("plant segment %d: %v", seq, err)
 	}
 }
 
 func readRaftSegment(t *testing.T, cfg Config, seq uint64) []byte {
 	t.Helper()
-	data, err := os.ReadFile(cfg.RaftLogPath(seq))
+	data, err := os.ReadFile(cfg.WALPath(seq))
 	if err != nil {
 		t.Fatalf("read segment %d: %v", seq, err)
 	}
 	return data
 }
 
-func testSegments(t *testing.T, cfg Config) []raftSegment {
+func testSegments(t *testing.T, cfg Config) []walSegment {
 	t.Helper()
-	segs, err := listRaftSegments(cfg)
+	segs, err := listWALSegments(cfg)
 	if err != nil {
 		t.Fatalf("list segments: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestRaftEntryByteLayout(t *testing.T) {
 
 	data := readRaftSegment(t, cfg, 1)
 	command := []byte("set k=v")
-	if want := kvstore.FrameHeaderSize + raftEntryHeaderSize + len(command); len(data) != want {
+	if want := kvstore.FrameHeaderSize + walEntryHeaderSize + len(command); len(data) != want {
 		t.Fatalf("segment bytes = %d, want %d", len(data), want)
 	}
 	head := data[:kvstore.FrameHeaderSize]
@@ -105,16 +105,16 @@ func TestRaftEntryByteLayout(t *testing.T) {
 	if err := kvstore.CheckFrame(uint32(len(entry)), binary.BigEndian.Uint32(head[4:8]), entry, 0); err != nil {
 		t.Errorf("frame crc: %v", err)
 	}
-	if entry[0] != OpRaftEntry {
+	if entry[0] != OpWALRecord {
 		t.Errorf("op = 0x%02x, want 0x10", entry[0])
 	}
-	if got := binary.BigEndian.Uint64(entry[raftEntryTermOffset:]); got != 3 {
+	if got := binary.BigEndian.Uint64(entry[walEntryTermOffset:]); got != 3 {
 		t.Errorf("term field = %d, want 3", got)
 	}
-	if got := binary.BigEndian.Uint64(entry[raftEntryIndexOffset:]); got != 1 {
+	if got := binary.BigEndian.Uint64(entry[walEntryIndexOffset:]); got != 1 {
 		t.Errorf("index field = %d, want 1", got)
 	}
-	if got := string(entry[raftEntryHeaderSize:]); got != "set k=v" {
+	if got := string(entry[walEntryHeaderSize:]); got != "set k=v" {
 		t.Errorf("command = %q, want %q", got, "set k=v")
 	}
 }
@@ -206,7 +206,7 @@ func TestScanRaftLogReportsHoleAsStateMismatch(t *testing.T) {
 	data := append(raftFrame(t, 1, 1, "a"), raftFrame(t, 1, 3, "c")...)
 	plantRaftSegment(t, cfg, 1, data)
 
-	_, err := scanRaftLog(cfg, zap.NewNop())
+	_, err := scanWAL(cfg, zap.NewNop())
 	if !errors.Is(err, ErrStateMismatch) {
 		t.Fatalf("scan with a hole = %v, want ErrStateMismatch", err)
 	}
@@ -217,7 +217,7 @@ func TestScanRaftLogReportsHoleAsStateMismatch(t *testing.T) {
 	if mismatch.index != 3 {
 		t.Errorf("reported index = %d, want 3", mismatch.index)
 	}
-	if got := fileSize(t, cfg.RaftLogPath(1)); got != int64(len(data)) {
+	if got := fileSize(t, cfg.WALPath(1)); got != int64(len(data)) {
 		t.Errorf("hole log truncated to %d bytes, want it left intact at %d", got, len(data))
 	}
 }
@@ -249,10 +249,10 @@ func TestScanRaftLogTruncatesBadTail(t *testing.T) {
 			return frame
 		}, "crc mismatch"},
 		{"op is not 0x10", func(t *testing.T) []byte {
-			entry := make([]byte, raftEntryHeaderSize+2)
+			entry := make([]byte, walEntryHeaderSize+2)
 			entry[0] = 0x01
-			binary.BigEndian.PutUint64(entry[raftEntryTermOffset:], 1)
-			binary.BigEndian.PutUint64(entry[raftEntryIndexOffset:], 2)
+			binary.BigEndian.PutUint64(entry[walEntryTermOffset:], 1)
+			binary.BigEndian.PutUint64(entry[walEntryIndexOffset:], 2)
 			frame, err := kvstore.EncodeFrame(entry)
 			if err != nil {
 				t.Fatalf("encode frame: %v", err)
@@ -269,14 +269,14 @@ func TestScanRaftLogTruncatesBadTail(t *testing.T) {
 			plantRaftSegment(t, cfg, 1, append(append([]byte(nil), good...), tail...))
 
 			core, logs := observer.New(zapcore.DebugLevel)
-			entries, err := scanRaftLog(cfg, zap.New(core))
+			entries, err := scanWAL(cfg, zap.New(core))
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
 			if len(entries) != 1 || entries[0].index != 1 {
 				t.Fatalf("recovered %d entries, want only the good prefix", len(entries))
 			}
-			if got := fileSize(t, cfg.RaftLogPath(1)); got != int64(len(good)) {
+			if got := fileSize(t, cfg.WALPath(1)); got != int64(len(good)) {
 				t.Errorf("segment length after repair = %d, want the record start at %d", got, len(good))
 			}
 			if n := countLogs(logs, "corrupt record tail"); n != 1 {
@@ -289,23 +289,23 @@ func TestScanRaftLogTruncatesBadTail(t *testing.T) {
 			} else if !strings.Contains(reason, c.reason) {
 				t.Errorf("reason = %q, want it to contain %q", reason, c.reason)
 			}
-			if n := countLogs(logs, "raft log truncated"); n != 1 {
-				t.Errorf("raft log truncated logs = %d, want 1", n)
+			if n := countLogs(logs, "wal truncated"); n != 1 {
+				t.Errorf("wal truncated logs = %d, want 1", n)
 			}
 
 			// 第二次重启：坏尾已经在盘上被抹掉，不该再报、也不该再截。
 			core2, logs2 := observer.New(zapcore.DebugLevel)
-			entries2, err := scanRaftLog(cfg, zap.New(core2))
+			entries2, err := scanWAL(cfg, zap.New(core2))
 			if err != nil {
 				t.Fatalf("second scan: %v", err)
 			}
 			if len(entries2) != 1 {
 				t.Errorf("second scan recovered %d entries, want 1", len(entries2))
 			}
-			if n := countLogs(logs2, "corrupt record tail") + countLogs(logs2, "raft log truncated"); n != 0 {
+			if n := countLogs(logs2, "corrupt record tail") + countLogs(logs2, "wal truncated"); n != 0 {
 				t.Errorf("second scan logged %d repair events, want 0", n)
 			}
-			if got := fileSize(t, cfg.RaftLogPath(1)); got != int64(len(good)) {
+			if got := fileSize(t, cfg.WALPath(1)); got != int64(len(good)) {
 				t.Errorf("second scan changed the length to %d, want %d", got, len(good))
 			}
 
@@ -343,7 +343,7 @@ func TestTruncateToLandsOnFrameStartAndAllowsReappend(t *testing.T) {
 		t.Fatalf("truncateTo(2): %v", err)
 	}
 	wantLen := int64(len(f1) + len(f2))
-	if got := fileSize(t, cfg.RaftLogPath(1)); got != wantLen {
+	if got := fileSize(t, cfg.WALPath(1)); got != wantLen {
 		t.Errorf("segment length = %d, want %d (frame end of index 2)", got, wantLen)
 	}
 	if got := l.lastIndex(); got != 2 {
@@ -367,7 +367,7 @@ func TestTruncateToLandsOnFrameStartAndAllowsReappend(t *testing.T) {
 	if e.term != 3 || string(e.cmd) != "rewritten" {
 		t.Errorf("index 3 = (term %d, %q), want (term 3, \"rewritten\")", e.term, e.cmd)
 	}
-	if got := fileSize(t, cfg.RaftLogPath(1)); got != wantLen+int64(len(rewritten)) {
+	if got := fileSize(t, cfg.WALPath(1)); got != wantLen+int64(len(rewritten)) {
 		t.Errorf("segment length = %d, want %d", got, wantLen+int64(len(rewritten)))
 	}
 }
@@ -495,7 +495,7 @@ func assertRaftLengths(t *testing.T, cfg Config, want []int64) {
 		if segs[i].seq != uint64(i+1) {
 			t.Fatalf("segment %d has seq %d, want a gapless run", i, segs[i].seq)
 		}
-		if got := fileSize(t, cfg.RaftLogPath(segs[i].seq)); got != w {
+		if got := fileSize(t, cfg.WALPath(segs[i].seq)); got != w {
 			t.Errorf("segment %d length = %d, want %d", segs[i].seq, got, w)
 		}
 	}
@@ -503,7 +503,7 @@ func assertRaftLengths(t *testing.T, cfg Config, want []int64) {
 
 func tmpFilesIn(t *testing.T, cfg Config) int {
 	t.Helper()
-	entries, err := os.ReadDir(cfg.RaftLogDir())
+	entries, err := os.ReadDir(cfg.WALDir())
 	if err != nil {
 		t.Fatalf("read the log dir: %v", err)
 	}
@@ -640,7 +640,7 @@ func TestRaftLogRecordsFramePositionsAcrossSegments(t *testing.T) {
 		if int64(len(data)) < e.offset+e.size {
 			t.Fatalf("index %d points past the end of segment %d", i, e.seq)
 		}
-		term, index, cmd, err := decodeRaftEntry(data[e.offset+kvstore.FrameHeaderSize:e.offset+e.size], e.offset)
+		term, index, cmd, err := decodeWALRecord(data[e.offset+kvstore.FrameHeaderSize:e.offset+e.size], e.offset)
 		if err != nil {
 			t.Fatalf("decode at index %d: %v", i, err)
 		}
@@ -659,7 +659,7 @@ func TestRaftLogRemovesTmpResidue(t *testing.T) {
 	if err := l.close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	residue := cfg.RaftLogTmpPath(2)
+	residue := cfg.WALTmpPath(2)
 	if err := os.WriteFile(residue, nil, 0o644); err != nil {
 		t.Fatalf("plant tmp residue: %v", err)
 	}
@@ -677,10 +677,10 @@ func TestRaftLogRemovesTmpResidue(t *testing.T) {
 }
 
 // 把活跃段的 fd 换成管道：Write 正常、Sync 一定 EINVAL，单独隔离出 fsync 失败。
-func detachRaftLogToPipe(t *testing.T, l *raftLog) {
+func detachRaftLogToPipe(t *testing.T, l *wal) {
 	t.Helper()
 	if err := l.file.Close(); err != nil {
-		t.Fatalf("close raft log fd: %v", err)
+		t.Fatalf("close wal fd: %v", err)
 	}
 	readEnd, writeEnd, err := os.Pipe()
 	if err != nil {
@@ -709,7 +709,7 @@ func TestRaftLogSyncFailureDisablesWritesOnly(t *testing.T) {
 	if err := l.sync(); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	durable := fileSize(t, cfg.RaftLogPath(1))
+	durable := fileSize(t, cfg.WALPath(1))
 
 	detachRaftLogToPipe(t, l)
 	if err := l.sync(); !errors.Is(err, kvstore.ErrIO) {
@@ -730,7 +730,7 @@ func TestRaftLogSyncFailureDisablesWritesOnly(t *testing.T) {
 	if e, ok := l.entryAt(1); !ok || string(e.cmd) != "a" {
 		t.Errorf("read path lost index 1: %v", ok)
 	}
-	if got := fileSize(t, cfg.RaftLogPath(1)); got != durable {
+	if got := fileSize(t, cfg.WALPath(1)); got != durable {
 		t.Errorf("committed file changed to %d bytes, want %d", got, durable)
 	}
 }
@@ -780,23 +780,23 @@ func TestRaftLogRolloverAndTruncateFields(t *testing.T) {
 	one := raftFrame(t, 1, 1, "payload-0")
 	cfg.MaxFileSize = int64(2 * len(one))
 
-	l, err := openRaftLog(cfg, zap.New(core))
+	l, err := openWAL(cfg, zap.New(core))
 	if err != nil {
-		t.Fatalf("open raft log: %v", err)
+		t.Fatalf("open wal: %v", err)
 	}
 	for i := uint64(1); i <= 4; i++ {
 		mustAppend(t, l, 1, i, fmt.Sprintf("payload-%d", i))
 	}
-	rolled := logs.FilterMessage("raft log rolled over").All()
+	rolled := logs.FilterMessage("wal rolled over").All()
 	if len(rolled) != 1 {
-		t.Fatalf("raft log rolled over logs = %d, want 1", len(rolled))
+		t.Fatalf("wal rolled over logs = %d, want 1", len(rolled))
 	}
 	rollFields := rolled[0].ContextMap()
-	if got := rollFields["from_file"]; got != cfg.RaftLogPath(1) {
-		t.Errorf("from_file = %v, want %q", got, cfg.RaftLogPath(1))
+	if got := rollFields["from_file"]; got != cfg.WALPath(1) {
+		t.Errorf("from_file = %v, want %q", got, cfg.WALPath(1))
 	}
-	if got := rollFields["to_file"]; got != cfg.RaftLogPath(2) {
-		t.Errorf("to_file = %v, want %q", got, cfg.RaftLogPath(2))
+	if got := rollFields["to_file"]; got != cfg.WALPath(2) {
+		t.Errorf("to_file = %v, want %q", got, cfg.WALPath(2))
 	}
 	if got, ok := rollFields["size_bytes"]; !ok || got != int64(2*len(one)) {
 		t.Errorf("size_bytes = %v/%v, want the full first segment", got, ok)
@@ -805,9 +805,9 @@ func TestRaftLogRolloverAndTruncateFields(t *testing.T) {
 	if err := l.truncateTo(1); err != nil {
 		t.Fatalf("truncateTo(1): %v", err)
 	}
-	cut := logs.FilterMessage("raft log suffix dropped").All()
+	cut := logs.FilterMessage("wal suffix dropped").All()
 	if len(cut) != 1 {
-		t.Fatalf("raft log suffix dropped logs = %d, want 1", len(cut))
+		t.Fatalf("wal suffix dropped logs = %d, want 1", len(cut))
 	}
 	for key, want := range map[string]any{
 		"kept_through_index": uint64(1),
@@ -823,22 +823,22 @@ func TestRaftLogRolloverAndTruncateFields(t *testing.T) {
 	}
 }
 
-// Sync 失败那条事件的字段（3.1 §10 的 raft log disabled 行）。
+// Sync 失败那条事件的字段（3.1 §10 的 wal disabled 行）。
 func TestRaftLogDisabledLogFields(t *testing.T) {
 	core, logs := observer.New(zapcore.DebugLevel)
 	cfg := testConfig(t)
-	l, err := openRaftLog(cfg, zap.New(core))
+	l, err := openWAL(cfg, zap.New(core))
 	if err != nil {
-		t.Fatalf("open raft log: %v", err)
+		t.Fatalf("open wal: %v", err)
 	}
 	mustAppend(t, l, 1, 1, "a")
 	detachRaftLogToPipe(t, l)
 	if err := l.sync(); !errors.Is(err, kvstore.ErrIO) {
 		t.Fatalf("sync on a pipe = %v, want ErrIO", err)
 	}
-	events := logs.FilterMessage("raft log disabled").All()
+	events := logs.FilterMessage("wal disabled").All()
 	if len(events) != 1 {
-		t.Fatalf("raft log disabled logs = %d, want 1", len(events))
+		t.Fatalf("wal disabled logs = %d, want 1", len(events))
 	}
 	disabledFields := events[0].ContextMap()
 	if got, ok := disabledFields["failed_at_offset"]; !ok || got != int64(26) {

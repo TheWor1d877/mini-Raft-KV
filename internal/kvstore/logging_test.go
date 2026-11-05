@@ -29,7 +29,10 @@ func TestLoggerCommonFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLogger = %v", err)
 	}
-	WithComponent(lg.Logger, ComponentWAL).Info("batch synced", KeyField("k1"), ValueField("hello"), zap.Int("batch_count", 64))
+	WithComponent(lg.Logger, ComponentWAL).Info("wal rolled over",
+		zap.String("from_file", "00000001.wal"),
+		zap.String("to_file", "00000002.wal"),
+		zap.Int64("size_bytes", 64))
 	if err := lg.Close(); err != nil {
 		t.Fatalf("Close = %v", err)
 	}
@@ -53,11 +56,11 @@ func TestLoggerCommonFields(t *testing.T) {
 			t.Errorf("field name %q is not lowercase snake_case", key)
 		}
 	}
-	if entry["component"] != ComponentWAL || entry["level"] != "info" || entry["msg"] != "batch synced" {
+	if entry["component"] != ComponentWAL || entry["level"] != "info" || entry["msg"] != "wal rolled over" {
 		t.Errorf("entry = %v", entry)
 	}
-	if entry["batch_count"] != float64(64) {
-		t.Errorf("batch_count = %v", entry["batch_count"])
+	if entry["size_bytes"] != float64(64) {
+		t.Errorf("size_bytes = %v", entry["size_bytes"])
 	}
 }
 
@@ -167,7 +170,7 @@ func TestNewLoggerRejectsBadLevel(t *testing.T) {
 
 func TestWithComponentViaObserver(t *testing.T) {
 	core, records := observer.New(zapcore.DebugLevel)
-	WithComponent(zap.New(core), ComponentRecovery).Warn("bad tail", zap.Int64("offset", 12345))
+	WithComponent(zap.New(core), ComponentWAL).Warn("corrupt record tail", zap.Int64("offset", 12345))
 
 	all := records.All()
 	if len(all) != 1 {
@@ -177,7 +180,7 @@ func TestWithComponentViaObserver(t *testing.T) {
 		t.Errorf("level = %v, want warn", all[0].Level)
 	}
 	fields := all[0].ContextMap()
-	if fields["component"] != ComponentRecovery || fields["offset"] != int64(12345) {
+	if fields["component"] != ComponentWAL || fields["offset"] != int64(12345) {
 		t.Errorf("fields = %v", fields)
 	}
 }

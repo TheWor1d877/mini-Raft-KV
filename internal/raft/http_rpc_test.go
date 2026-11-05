@@ -713,7 +713,7 @@ func (c *httpCluster) breakSync(id string) {
 	t.Cleanup(func() { _ = pr.Close() })
 
 	if err := n.log.file.Close(); err != nil {
-		t.Fatalf("close the real raft log file: %v", err)
+		t.Fatalf("close the real wal file: %v", err)
 	}
 	n.log.file = pw
 	c.broken[id] = true

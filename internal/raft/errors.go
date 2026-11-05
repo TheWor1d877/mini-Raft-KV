@@ -36,7 +36,7 @@ func ErrStateMismatchAt(index uint64, reason string) error {
 }
 
 // D5、D19：raft 日志的 Sync 失败之后，盘上边界未知，写路径一律拒绝，读路径继续服务。
-var errRaftLogDisabled = fmt.Errorf("raft log disabled by an earlier fsync failure: %w", kvstore.ErrIO)
+var errWALDisabled = fmt.Errorf("wal disabled by an earlier fsync failure: %w", kvstore.ErrIO)
 
 // handler 侧的类别映射：只按哨兵判，不看错误文本（与 2.1 §4 同口径）。
 // ErrStateMismatch 不给专门的 code：它是「复制逻辑已经错了」级别的信号，落到 internal 那一档，

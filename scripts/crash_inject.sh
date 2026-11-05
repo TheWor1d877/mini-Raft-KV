@@ -17,11 +17,11 @@
 #   lost          acked - recovered；必须等于 0
 #   boot_ms       重启到就绪的耗时
 #   segments      段文件条数
-#   stale_tmp     kill -9 之后、重启之前的 *.rlog.tmp 条数
+#   stale_tmp     kill -9 之后、重启之前的 *.wal.tmp 条数
 #
 # durable 的取数：只读重启那一段的进程日志（日志跨重启续写，所以用行号把区间卡住），
 # 口径是「恢复出的 KV 写条数」，no-op 那一帧从头到尾都不进这个数：
-# "state rebuilt from raft log" 的 replayed_entries 只数解出 key/value 的条目，
+# "state rebuilt from wal" 的 replayed_entries 只数解出 key/value 的条目，
 # 也就是 [1, lastApplied] 那段里的写；其后 (lastApplied, commitIndex] 的补 apply
 # 只数 component=kv 的 "entry applied"（raft 侧那条同名的行对每个 index 都打，含 no-op）。
 # 两者相加就是日志恢复出的写条数，与 acked 同量纲，not_durable 才等于「没落盘的确认写」。
@@ -54,9 +54,9 @@ if [[ ! -x "$BIN" ]]; then
 	exit 1
 fi
 
-# 目录名与扩展名各收在这里：step 4 改名（raft/log→raft/wal、.rlog→.wal）只动下面两行。
-SEG_DIR_REL="raft/log"
-SEG_EXT="rlog"
+# 目录名与扩展名各收在这里：一份日志只有这一处口径（docs/8 §二）。
+SEG_DIR_REL="raft/wal"
+SEG_EXT="wal"
 NODE_LOG_REL="log/miniraft-node.log"
 
 DATA="$(mktemp -d -t miniraft-crash-XXXXXX)"
@@ -139,16 +139,17 @@ ended=$(date +%s.%N)
 boot_ms="$(awk -v a="$started" -v b="$ended" 'BEGIN { printf "%.1f", (b - a) * 1000 }')"
 
 # 节点日志是 O_APPEND 续写的，两次启动的行都在同一个文件里，所以区间下界取最后一次
-# state rebuilt from raft log 的行号：重启那一次的读数全在它之后。
+# state rebuilt from wal 的行号：重启那一次的读数全在它之后。
 # 取行号而不是 kill 时刻的行数：kill 落在写日志的中间时，那一行会被重启的首行接上，成不了合法 JSON。
-log_mark=$(grep -n '"msg":"state rebuilt from raft log"' "$NODE_LOG" | tail -1 | cut -d: -f1)
+# `|| true`：grep 无匹配时返回 1，set -e 会让这行赋值直接退出，下面的报错永远打不出来。
+log_mark=$(grep -n '"msg":"state rebuilt from wal"' "$NODE_LOG" | tail -1 | cut -d: -f1 || true)
 if [[ -z "$log_mark" ]]; then
-	echo "日志里没有 state rebuilt from raft log，读数取不到" >&2
+	echo "日志里没有 state rebuilt from wal，读数取不到" >&2
 	exit 1
 fi
 replayed="$(sed -n "${log_mark}p" "$NODE_LOG" | jq -R 'fromjson? | .replayed_entries')"
 if [[ -z "$replayed" || "$replayed" == "null" ]]; then
-	echo "第 $log_mark 行的 state rebuilt from raft log 解不出 replayed_entries" >&2
+	echo "第 $log_mark 行的 state rebuilt from wal 解不出 replayed_entries" >&2
 	sed -n "${log_mark}p" "$NODE_LOG" >&2 || true
 	exit 1
 fi

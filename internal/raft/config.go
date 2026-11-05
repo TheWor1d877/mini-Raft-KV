@@ -16,7 +16,7 @@ import (
 	"github.com/TheWor1d877/mini-Raft-KV/internal/kvstore"
 )
 
-// 默认值、上限与命名规则只有这一处；state 与 raftlog 都从这里取（与 2.1 §6 同口径）。
+// 默认值、上限与命名规则只有这一处；state 与 WAL 都从这里取（与 2.1 §6 同口径）。
 // 段上限沿用 kvstore.DefaultMaxFileSize：命令行只有一根 -max-file-size，两个模块同一个值（3.1 §6）。
 const (
 	DefaultLogLevel = kvstore.DefaultLogLevel
@@ -32,20 +32,20 @@ const (
 	DefaultReadTimeoutMS = int64(1000)
 
 	RaftDirName      = "raft"
-	RaftLogDirName   = "log"
+	WALDirName       = "wal"
 	StateFileName    = "state"
 	StateTmpFileName = "state.tmp"
 
-	RaftLogFileFormat    = "%08d.rlog"
-	RaftLogTmpFileFormat = "%08d.rlog.tmp"
+	WALFileFormat    = "%08d.wal"
+	WALTmpFileFormat = "%08d.wal.tmp"
 
 	// 一个进程一份节点日志；kvstore 的 NewLogger 固定写 2.1 的 miniraft-kv.log，导出面不动，
 	// 所以 raft 侧按同款编码自己开一份（3.1 §6 末段）。
 	NodeLogFileName = "miniraft-node.log"
 
-	// component 取值在 2.1 §8 的集合上加这两个（3.1 §10）。
-	ComponentRaft    = "raft"
-	ComponentRaftLog = "raftlog"
+	// component 取值在 2.1 §8 的集合上加这一个（3.1 §10）：
+	// 合并之后 WAL 就是唯一的日志部件，raftlog 与 recovery 两个旧值一并收进 kvstore 的 wal。
+	ComponentRaft = "raft"
 )
 
 // ReadMode 是节点级的默认线性读法：lease 走领导权租约，readindex 走逐读确认轮（4.1 §6）。
@@ -119,14 +119,14 @@ func (c Config) Majority() int { return len(c.Peers)/2 + 1 }
 func (c Config) RaftDir() string      { return filepath.Join(c.DataDir, RaftDirName) }
 func (c Config) StatePath() string    { return filepath.Join(c.RaftDir(), StateFileName) }
 func (c Config) StateTmpPath() string { return filepath.Join(c.RaftDir(), StateTmpFileName) }
-func (c Config) RaftLogDir() string   { return filepath.Join(c.RaftDir(), RaftLogDirName) }
+func (c Config) WALDir() string       { return filepath.Join(c.RaftDir(), WALDirName) }
 
-func (c Config) RaftLogPath(seq uint64) string {
-	return filepath.Join(c.RaftLogDir(), fmt.Sprintf(RaftLogFileFormat, seq))
+func (c Config) WALPath(seq uint64) string {
+	return filepath.Join(c.WALDir(), fmt.Sprintf(WALFileFormat, seq))
 }
 
-func (c Config) RaftLogTmpPath(seq uint64) string {
-	return filepath.Join(c.RaftLogDir(), fmt.Sprintf(RaftLogTmpFileFormat, seq))
+func (c Config) WALTmpPath(seq uint64) string {
+	return filepath.Join(c.WALDir(), fmt.Sprintf(WALTmpFileFormat, seq))
 }
 
 // LogDir 与 NodeLogPath 走的是 2.1 的目录布局：日志跟 wal、raft 平级，都在数据目录里。
@@ -202,7 +202,7 @@ func (c Config) Validate() error {
 
 // 建目录用 0755，与 kvstore 的 lockAndPrepare 一致（2.1 §6）。
 func (c Config) ensureDirs() error {
-	for _, dir := range []string{c.DataDir, c.RaftDir(), c.RaftLogDir()} {
+	for _, dir := range []string{c.DataDir, c.RaftDir(), c.WALDir()} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return kvstore.ErrIOFrom("create raft dir", 0, err)
 		}
@@ -247,7 +247,7 @@ func load(name string, args []string, memberTable bool) (Config, kvstore.Config,
 	fs.Int64Var(&cfg.ElectionTimeoutMS, "election-timeout-ms", cfg.ElectionTimeoutMS, "base election timeout T")
 	fs.Int64Var(&cfg.HeartbeatMS, "heartbeat-ms", cfg.HeartbeatMS, "leader heartbeat period, must be under T")
 	fs.Int64Var(&cfg.TickMS, "tick-ms", cfg.TickMS, "period the entry layer calls Tick() at")
-	fs.BoolVar(&cfg.Fsync, "raft-fsync", cfg.Fsync, "fsync every raft log batch; disable only for the throughput comparison")
+	fs.BoolVar(&cfg.Fsync, "raft-fsync", cfg.Fsync, "fsync every wal append; disable only for the throughput comparison")
 	fs.Int64Var(&cfg.MaxFileSize, "max-file-size", cfg.MaxFileSize, "bytes per segment file before rollover")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "debug, info, warn, error, panic, fatal")
 	fs.StringVar(&readMode, "read-mode", string(cfg.ReadMode), "linearizable read path: lease or readindex")

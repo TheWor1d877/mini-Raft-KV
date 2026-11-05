@@ -106,7 +106,7 @@ type Node struct {
 
 	mu    sync.Mutex
 	state *stateFile
-	log   *raftLog
+	log   *wal
 
 	role        Role
 	term        uint64
@@ -163,7 +163,7 @@ func NewNode(cfg Config, kv *kvstore.KV, tp Transport, lg *zap.Logger) (*Node, e
 	if err != nil {
 		return nil, err
 	}
-	rl, err := openRaftLog(cfg, lg)
+	rl, err := openWAL(cfg, lg)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +224,7 @@ func (n *Node) replayLog() error {
 		n.kv.Apply(key, value)
 		replayed++
 	}
-	n.lg.Info("state rebuilt from raft log",
+	n.lg.Info("state rebuilt from wal",
 		zap.String("node_id", n.cfg.NodeID),
 		zap.Int("replayed_entries", replayed),
 		zap.Uint64("last_applied", n.lastApplied))
@@ -235,7 +235,7 @@ func (n *Node) replayLog() error {
 // 游标比日志还长，说明两个文件里至少有一个不是同一次提交的产物。
 func checkCursors(st State, lastLogIndex uint64) error {
 	if st.CommitIndex > lastLogIndex {
-		return ErrStateMismatchAt(st.CommitIndex, "commitIndex is past the end of the raft log")
+		return ErrStateMismatchAt(st.CommitIndex, "commitIndex is past the end of the wal")
 	}
 	if st.LastApplied > st.CommitIndex {
 		return ErrStateMismatchAt(st.LastApplied, "lastApplied is past commitIndex")
@@ -550,7 +550,7 @@ func (n *Node) Propose(ctx context.Context, key, value string) (uint64, uint64, 
 		return 0, 0, err
 	}
 	if err := n.log.sync(); err != nil {
-		// Sync 失败时盘上边界未知，写路径由 raftLog 自己关掉（D5），这条不登记回调。
+		// Sync 失败时盘上边界未知，写路径由 wal 自己关掉（D5），这条不登记回调。
 		n.mu.Unlock()
 		return 0, 0, err
 	}

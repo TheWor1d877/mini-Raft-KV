@@ -46,7 +46,7 @@ func (n *Node) applyCommitted() error {
 	for index := n.lastApplied + 1; index <= n.commitIndex; index++ {
 		e, ok := n.log.entryAt(index)
 		if !ok {
-			return ErrStateMismatchAt(index, "commitIndex points past the raft log")
+			return ErrStateMismatchAt(index, "commitIndex points past the wal")
 		}
 		if len(e.cmd) > 0 {
 			key, value, err := kvstore.DecodeEntry(e.cmd, e.offset)

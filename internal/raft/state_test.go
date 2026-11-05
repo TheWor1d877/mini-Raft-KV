@@ -290,9 +290,9 @@ func TestConfigRaftPaths(t *testing.T) {
 		{cfg.RaftDir(), filepath.Join("data/node-1", "raft")},
 		{cfg.StatePath(), filepath.Join("data/node-1", "raft", "state")},
 		{cfg.StateTmpPath(), filepath.Join("data/node-1", "raft", "state.tmp")},
-		{cfg.RaftLogDir(), filepath.Join("data/node-1", "raft", "log")},
-		{cfg.RaftLogPath(1), filepath.Join("data/node-1", "raft", "log", "00000001.rlog")},
-		{cfg.RaftLogTmpPath(12), filepath.Join("data/node-1", "raft", "log", "00000012.rlog.tmp")},
+		{cfg.WALDir(), filepath.Join("data/node-1", "raft", "wal")},
+		{cfg.WALPath(1), filepath.Join("data/node-1", "raft", "wal", "00000001.wal")},
+		{cfg.WALTmpPath(12), filepath.Join("data/node-1", "raft", "wal", "00000012.wal.tmp")},
 	} {
 		if c.got != filepath.Clean(c.want) {
 			t.Errorf("path = %q, want %q", c.got, c.want)

@@ -613,7 +613,7 @@ func valueTag(value string) string {
 // 尾部被 kill -9 截断的半条记录停在坏帧处，不往后读。
 func raftLogValueIndex(root, nodeID, key string) map[string]uint64 {
 	out := map[string]uint64{}
-	paths, err := filepath.Glob(filepath.Join(root, nodeID, RaftDirName, RaftLogDirName, "*.rlog"))
+	paths, err := filepath.Glob(filepath.Join(root, nodeID, RaftDirName, WALDirName, "*.wal"))
 	if err != nil {
 		return out
 	}
@@ -636,7 +636,7 @@ func raftLogValueIndex(root, nodeID, key string) map[string]uint64 {
 			if err := kvstore.CheckFrame(size, checksum, payload, int64(off)); err != nil {
 				break
 			}
-			_, index, cmd, err := decodeRaftEntry(payload, int64(off))
+			_, index, cmd, err := decodeWALRecord(payload, int64(off))
 			if err != nil {
 				break
 			}
