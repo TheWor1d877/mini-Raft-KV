@@ -53,9 +53,6 @@ func ErrLockedFrom(dir string, err error) error {
 	return fmt.Errorf("lock %s: %w: %w", dir, ErrLocked, err)
 }
 
-// D5：fsync 失败之后写路径永久关闭，读路径继续服务。
-var errWALDisabled = fmt.Errorf("wal disabled by an earlier fsync failure: %w", ErrIO)
-
 // errnoOf 给日志的 errno 字段取值，取不到返回 0，调用方再按错误文本兜底。
 func errnoOf(err error) syscall.Errno {
 	var errno syscall.Errno

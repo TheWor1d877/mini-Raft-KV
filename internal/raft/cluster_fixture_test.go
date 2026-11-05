@@ -108,10 +108,8 @@ type cluster struct {
 	// appendQueue 与 blocked 从 M11 起用得上，夹具一次建齐（T21.5）。
 	appendQueue map[string][]appendReplySpec
 	blocked     map[string]map[string]bool
-	// broken 记的是被 breakKV 关过 KV 的节点：这些节点收尾时的 ErrIO 是夹具自己造的失效。
-	broken map[string]bool
-	addrID map[string]string
-	closed bool
+	addrID      map[string]string
+	closed      bool
 
 	// clock 是读路径的假时钟：节点们共用一根计数器，用例拨它，
 	// 或者让每条为在途确认轮发出的 AppendEntries 前进 clockStep（4.1 §7）。
@@ -139,7 +137,6 @@ func newClusterCfg(t *testing.T, size int, lg *zap.Logger, mut func(*Config)) *c
 		voteQueue:   map[string][]VoteReply{},
 		appendQueue: map[string][]appendReplySpec{},
 		blocked:     map[string]map[string]bool{},
-		broken:      map[string]bool{},
 		addrID:      map[string]string{},
 		clock:       &fakeClock{},
 	}
@@ -165,9 +162,6 @@ func newClusterCfg(t *testing.T, size int, lg *zap.Logger, mut func(*Config)) *c
 		kcfg := kvstore.DefaultConfig()
 		kcfg.DataDir = cfg.DataDir
 		kcfg.MaxFileSize = cfg.MaxFileSize
-		kcfg.Fsync = cfg.Fsync
-		// 与 raft.Load 一致：夹具里的 map 也从 raft 日志回放重建，不读 KV WAL。
-		kcfg.SkipWALRecovery = true
 		c.kvCfg[id] = kcfg
 		c.start(id)
 	}
@@ -200,22 +194,18 @@ func (c *cluster) restart(id string) *Node {
 	return c.nodes[id]
 }
 
-// breakKV 只关掉这个节点的 KV 句柄、Node 照常活着：kvstore 的 WAL 在文件已关之后
-// 一律拒绝写，apply 的 Put 与 Flush 从此确定失败（3.2 §3 的 Flush 失败那格，D5 的下游）。
-// 记进 broken：之后 Node.Close 的 kv.Flush 一定带 ErrIO，那是这条失效链的应有形状。
-func (c *cluster) breakKV(id string) {
-	kv := c.kvs[id]
-	delete(c.kvs, id)
-	c.broken[id] = true
-	if err := kv.Close(); err != nil {
-		c.t.Fatalf("break kv for %s: %v", id, err)
-	}
+// breakLog 关掉这个节点 raft 日志的写路径：等价于一次 Sync 失败之后盘上边界未知的状态（D5）。
+// 追加与 Sync 从此一律拒绝，读路径与状态机照常——合并之后失效源只有这一处。
+func (c *cluster) breakLog(id string) {
+	n := c.node(id)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.log.failed = true
 }
 
 // recover 按同一份数据目录重建节点，走的就是 load + 补 apply 那条恢复路径（3.1 §7 启动）。
 func (c *cluster) recover(id string) *Node {
 	c.closeNode(id)
-	c.broken[id] = false
 	c.start(id)
 	return c.node(id)
 }
@@ -234,10 +224,6 @@ func (c *cluster) stopNode(id string) error {
 	if n := c.nodes[id]; n != nil {
 		delete(c.nodes, id)
 		err = n.Close()
-		// breakKV 过的节点收尾必带 ErrIO；这条是夹具造的，不当收尾失败。
-		if c.broken[id] && errors.Is(err, kvstore.ErrIO) {
-			err = nil
-		}
 	}
 	if kv := c.kvs[id]; kv != nil {
 		delete(c.kvs, id)

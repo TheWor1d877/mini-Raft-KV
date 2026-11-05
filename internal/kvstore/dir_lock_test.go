@@ -14,13 +14,19 @@ import (
 )
 
 const (
-	lockChildEnv = "MINIRAFT_LOCK_CHILD"
-	lockDirEnv   = "MINIRAFT_LOCK_DIR"
-	lockMarker   = "child-locked"
+	lockDirEnv = "MINIRAFT_LOCK_DIR"
+	lockMarker = "child-locked"
 )
 
+func lockTestConfig(t *testing.T) Config {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.DataDir = t.TempDir()
+	return cfg
+}
+
 func TestSecondProcessIsRejected(t *testing.T) {
-	cfg := newTestWALConfig(t)
+	cfg := lockTestConfig(t)
 	lg, records := observerLogger()
 
 	lock, err := lockAndPrepare(cfg, lg)
@@ -41,9 +47,6 @@ func TestSecondProcessIsRejected(t *testing.T) {
 	if _, err := os.Stat(cfg.LockPath()); err != nil {
 		t.Errorf("lock file missing: %v", err)
 	}
-	if _, err := os.Stat(cfg.WALDir()); err != nil {
-		t.Errorf("wal dir missing: %v", err)
-	}
 
 	held := records.FilterMessage("data dir locked").All()
 	if len(held) != 1 {
@@ -57,21 +60,14 @@ func TestSecondProcessIsRejected(t *testing.T) {
 	}
 }
 
-// 锁随 fd 关闭而释放：同一进程内 Close 之后能再次 Open。
+// 锁随 fd 关闭而释放：同一进程内 unlock 之后能再次 lockAndPrepare。
+// 旧格里「重开 WAL 续写」的半段随 KV WAL 一起取消，段的续写归 raft 侧（docs/8 §三）。
 func TestUnlockAllowsReopen(t *testing.T) {
-	cfg := newTestWALConfig(t)
+	cfg := lockTestConfig(t)
 
 	lock, err := lockAndPrepare(cfg, zap.NewNop())
 	if err != nil {
 		t.Fatalf("lockAndPrepare = %v", err)
-	}
-	w, err := newWAL(cfg, zap.NewNop())
-	if err != nil {
-		t.Fatalf("newWAL = %v", err)
-	}
-	appendEntry(t, w, "k1", "v1")
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close = %v", err)
 	}
 	if err := lock.unlock(); err != nil {
 		t.Fatalf("unlock = %v", err)
@@ -82,21 +78,9 @@ func TestUnlockAllowsReopen(t *testing.T) {
 		t.Fatalf("relock = %v", err)
 	}
 	defer func() { _ = lock2.unlock() }()
-	w2, err := newWAL(cfg, zap.NewNop())
-	if err != nil {
-		t.Fatalf("newWAL after relock = %v", err)
-	}
-	defer func() { _ = w2.Close() }()
 
-	if w2.seq != w.seq {
-		t.Errorf("reopened segment %d, want the active %d", w2.seq, w.seq)
-	}
-	if w2.size != w.size {
-		t.Errorf("reopened size %d, want %d", w2.size, w.size)
-	}
-	appendEntry(t, w2, "k2", "v2")
-	if got := readRecords(t, w2.activePath()); len(got) != 2 {
-		t.Errorf("file holds %d records after reopening and appending, want 2", len(got))
+	if _, err := Open(cfg, zap.NewNop()); err == nil {
+		t.Error("Open on a dir whose lock was just re-taken succeeded")
 	}
 }
 
@@ -120,7 +104,7 @@ func TestLockSurvivesProcessDeath(t *testing.T) {
 	dir := t.TempDir()
 	stderr := &bytes.Buffer{}
 	cmd := exec.Command(os.Args[0], "-test.run=TestLockSurvivesProcessDeath")
-	cmd.Env = append(os.Environ(), lockChildEnv+"=1", lockDirEnv+"="+dir)
+	cmd.Env = append(os.Environ(), lockDirEnv+"="+dir)
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start child: %v", err)

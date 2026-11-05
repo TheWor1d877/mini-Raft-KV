@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"testing"
@@ -11,10 +12,10 @@ import (
 	"github.com/TheWor1d877/mini-Raft-KV/internal/kvstore"
 )
 
-// 两条恢复路径要给出同一个 map：KV WAL 回放（合并前的主恢复源）与 raft 日志回放
-// （合并后唯一的恢复源）。逐 key 对拍，另外再和「写进去的那个值」对一次地，
-// 免得两条一起错还互相印证。docs/8 第 1 步的等价性证据，是后面删 KV WAL 的前提。
-func TestRecoverySourcesAgreeKeyByKey(t *testing.T) {
+// 日志是唯一恢复源：把 state 的游标退回一半，重启后 [1, lastApplied] 由回放重建、
+// (lastApplied, commitIndex] 由补 apply 接手，两半合起来要逐 key 等于写进去的值。
+// 覆盖重复写的 key：后一条必须盖在前一条之上；当选那条 no-op 空 command 要跳过（docs/8 §二、§六）。
+func TestRecoveryRebuildsTheMapFromTheLog(t *testing.T) {
 	c := newCluster(t, 3, zap.NewNop())
 	leaderID := c.waitForLeader(t, 60)
 
@@ -29,19 +30,17 @@ func TestRecoverySourcesAgreeKeyByKey(t *testing.T) {
 	for i := range 40 {
 		write(fmt.Sprintf("eq-%03d", i), fmt.Sprintf("v-%d", i))
 	}
-	// 覆盖 10 个 key：两个恢复源都得让后写的盖在前面的之上。
 	for i := range 10 {
 		write(fmt.Sprintf("eq-%03d", i*4), fmt.Sprintf("overwritten-%d", i))
 	}
 
-	// Leader 之外的那个节点先跑起来，让写入落进它的日志与 KV WAL，再收尾。
-	// 当选时写的那条 no-op 也在日志里，回放要跳过它（docs/8 §六）。
+	// Leader 之外的那个节点先跑起来，让写入落进它的日志，再收尾。
+	// 全集群都要 Tick：最后一次写的 commitIndex 是回执之后才涨的，
+	// 只有 Leader 的下一轮心跳才把它带给这个 Follower。
 	follower := c.ids[0]
 	if follower == leaderID {
 		follower = c.ids[1]
 	}
-	// 全集群都要 Tick：最后一次写的 commitIndex 是回执之后才涨的，
-	// 只有 Leader 的下一轮心跳才把它带给这个 Follower。
 	c.tick(4)
 	before := c.node(follower).Stats()
 	if before.CommitIndex == 0 {
@@ -51,8 +50,7 @@ func TestRecoverySourcesAgreeKeyByKey(t *testing.T) {
 		t.Fatalf("stop %s: %v", follower, err)
 	}
 
-	// 游标退回一半，让日志回放接手 [1, lastApplied]、applyCommitted 接手差额，
-	// 两半都盖到才对得起整条恢复链。
+	// 游标退回一半，让回放接手 [1, lastApplied]、applyCommitted 接手差额。
 	sf := newStateFile(c.raftCfg[follower], zap.NewNop())
 	st, err := sf.load()
 	if err != nil {
@@ -72,49 +70,53 @@ func TestRecoverySourcesAgreeKeyByKey(t *testing.T) {
 	}
 	sort.Strings(keys)
 
-	// 路径 A：KV WAL 回放。
-	kcfgWAL := c.kvCfg[follower]
-	kcfgWAL.SkipWALRecovery = false
-	kvWAL, err := kvstore.Open(kcfgWAL, zap.NewNop())
-	if err != nil {
-		t.Fatalf("open kv with WAL recovery: %v", err)
-	}
-	fromWAL := recoverValues(t, kvWAL, keys)
-	if err := kvWAL.Close(); err != nil {
-		t.Fatalf("close kv after WAL recovery: %v", err)
-	}
-
-	// 路径 B：跳过 KV WAL，由 NewNode 回放 raft 日志 + 补 apply 差额。
-	kvLog, err := kvstore.Open(c.kvCfg[follower], zap.NewNop())
-	if err != nil {
-		t.Fatalf("open kv without WAL recovery: %v", err)
-	}
-	nodeLog, err := NewNode(c.raftCfg[follower], kvLog, &stubTransport{c: c, id: follower}, zap.NewNop())
-	if err != nil {
-		t.Fatalf("new node from the raft log: %v", err)
-	}
-	fromLog := recoverValues(t, kvLog, keys)
-	after := nodeLog.Stats()
+	restarted := c.restart(follower)
+	fromLog := recoverValues(t, c.kv(follower), keys)
+	after := restarted.Stats()
 	if after.LastApplied != after.CommitIndex {
 		t.Errorf("lastApplied %d != commitIndex %d after recovery: the gap was not applied",
 			after.LastApplied, after.CommitIndex)
 	}
-	if err := nodeLog.Close(); err != nil {
-		t.Fatalf("close the log-recovered node: %v", err)
-	}
-	if err := kvLog.Close(); err != nil {
-		t.Fatalf("close kv after log recovery: %v", err)
-	}
 
 	for _, key := range keys {
-		if fromWAL[key] != fromLog[key] {
-			t.Errorf("%s: WAL recovery = %q, log recovery = %q, want the two sources to agree",
-				key, fromWAL[key], fromLog[key])
-			continue
+		if fromLog[key] != want[key] {
+			t.Errorf("%s: log recovery = %q, written %q", key, fromLog[key], want[key])
 		}
-		if fromWAL[key] != want[key] {
-			t.Errorf("%s: both sources recovered %q, written %q", key, fromWAL[key], want[key])
-		}
+	}
+}
+
+// 游标指向的条目解不出一 KV 操作，就在启动期失败，不静默跳过（docs/8 §六第二条）。
+// 帧头与 crc 都是好的，坏的是 command 内部：日志扫描看不出问题，只有 apply 这一层拦得住。
+func TestRecoveryRefusesToSkipAnUndecodableEntry(t *testing.T) {
+	c := newCluster(t, 1, zap.NewNop())
+	if err := c.stopNode("node-1"); err != nil {
+		t.Fatalf("stop node: %v", err)
+	}
+	cfg := c.raftCfg["node-1"]
+
+	l, err := openRaftLog(cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("open the log: %v", err)
+	}
+	mustAppend(t, l, 1, 1, "\x01\x00")
+	if err := l.sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if err := l.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := newStateFile(cfg, zap.NewNop()).store(State{CurrentTerm: 1, CommitIndex: 1, LastApplied: 1}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	kv, err := kvstore.Open(c.kvCfg["node-1"], zap.NewNop())
+	if err != nil {
+		t.Fatalf("open kv: %v", err)
+	}
+	t.Cleanup(func() { _ = kv.Close() })
+	_, err = NewNode(cfg, kv, &stubTransport{c: c, id: "node-1"}, zap.NewNop())
+	if !errors.Is(err, kvstore.ErrCorruptRecord) {
+		t.Fatalf("NewNode over an undecodable entry = %v, want ErrCorruptRecord", err)
 	}
 }
 

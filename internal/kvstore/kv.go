@@ -8,12 +8,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// 内存状态机：写路径先追加 WAL，落盘到位之后才改 map。
+// 内存状态机：只有 map。持久性由 raft 日志的追加与 Sync 负责，这里不再有自己的操作日志（docs/8 §二）。
 type KV struct {
 	cfg  Config
 	lg   *zap.Logger
 	lock *dirLock
-	wal  *wal
 
 	mu   sync.RWMutex
 	data map[string]string
@@ -34,6 +33,7 @@ func RequestID(ctx context.Context) string {
 	return id
 }
 
+// Open 只建目录、拿锁，map 交给调用方回放日志重建（3.1 §7 的启动序列）。
 func Open(cfg Config, lg *zap.Logger) (*KV, error) {
 	start := time.Now()
 
@@ -51,65 +51,23 @@ func Open(cfg Config, lg *zap.Logger) (*KV, error) {
 	if err != nil {
 		return fail(err, nil)
 	}
-	var rec recovered
-	if !cfg.SkipWALRecovery {
-		rec, err = scanWAL(cfg, lg)
-		if err != nil {
-			return fail(err, lock)
-		}
-	}
-	w, err := newWAL(cfg, lg)
-	if err != nil {
-		return fail(err, lock)
-	}
-
-	data := make(map[string]string, len(rec.entries))
-	for _, e := range rec.entries {
-		data[e[0]] = e[1]
-	}
 	lg.Info("store opened",
 		zap.String("data_dir", cfg.DataDir),
-		zap.Int("file_count", rec.fileCount),
-		zap.Int("recovered_entries", len(rec.entries)),
-		zap.Bool("skip_wal_recovery", cfg.SkipWALRecovery),
-		zap.Int64("duration_ms", durationMS(time.Since(start))))
+		zap.Int64("duration_ms", time.Since(start).Milliseconds()))
 
-	return &KV{cfg: cfg, lg: WithComponent(lg, ComponentKV), lock: lock, wal: w, data: data}, nil
+	return &KV{cfg: cfg, lg: WithComponent(lg, ComponentKV), lock: lock, data: map[string]string{}}, nil
 }
 
-// 追加与批次落盘都成功，才让这条写入对读可见。
-func (k *KV) Put(ctx context.Context, key, value string) error {
-	entry, err := EncodeEntry(key, value)
-	if err != nil {
-		return err
-	}
-
-	k.mu.Lock()
-	defer k.mu.Unlock()
-
-	opSeq, err := k.wal.append(entry)
-	if err != nil {
-		k.lg.Error("put rejected",
-			zap.String("req_id", RequestID(ctx)),
-			zap.Int("errno", int(errnoOf(err))),
-			zap.Error(err))
-		return err
-	}
-	k.data[key] = value
-	k.lg.Debug("put applied",
-		zap.String("req_id", RequestID(ctx)),
-		zap.Uint64("op_seq", opSeq),
-		KeyField(key),
-		ValueField(value),
-		zap.String("value_fp", valueFingerprint(value)))
-	return nil
-}
-
-// Apply 只做状态机改动，不落任何日志：raft 日志的回放与补 apply 走这条路（docs/8 §二）。
+// Apply 是一次状态机改动：不落日志、不 fsync，落盘边界由调用方的日志写入定（docs/8 §二）。
+// 重复 apply 同一条赋值没有副作用，所以恢复与补 apply 都可以从头再来一遍（D4）。
 func (k *KV) Apply(key, value string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.data[key] = value
+	k.lg.Debug("entry applied",
+		KeyField(key),
+		ValueField(value),
+		zap.String("value_fp", valueFingerprint(value)))
 }
 
 func (k *KV) Get(key string) (string, error) {
@@ -123,27 +81,7 @@ func (k *KV) Get(key string) (string, error) {
 	return value, nil
 }
 
-func (k *KV) Flush() error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.wal.Flush()
-}
-
-// 落盘剩余批次，再释放文件与目录锁。
+// 释放目录锁：map 里没有等着落盘的东西，日志与游标的收尾归 raft 侧。
 func (k *KV) Close() error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-
-	err := k.wal.Close()
-	if uerr := k.lock.unlock(); err == nil {
-		err = uerr
-	}
-	return err
-}
-
-// 写路径是否已被 fsync 失败关掉；读路径不受影响（D5）。
-func (k *KV) WriteDisabled() bool {
-	k.mu.RLock()
-	defer k.mu.RUnlock()
-	return k.wal.disabled()
+	return k.lock.unlock()
 }

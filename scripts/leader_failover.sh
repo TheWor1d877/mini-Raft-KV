@@ -16,6 +16,8 @@ INFLIGHT_WRITES="${3:-20}"
 KILL_DELAY_MS="${4:-150}"
 STATE="$ROOT_DATA/cluster.up"
 LOG_REL="log/miniraft-node.log"
+# stderr 的落点跟 cluster_up.sh 同一份口径：日志目录名只有这一处。
+STDERR_REL="log/stderr.txt"
 # 一轮最多等多久：选举超时 T 默认 500ms、随机窗口 [T,2T)，这里留够两轮重选的余量。
 ELECT_DEADLINE_MS=20000
 
@@ -194,7 +196,7 @@ for ((round = 1; round <= ROUNDS; round++)); do
 
 	# 放回被杀的节点，下一轮才是同样的 5 节点条件；清单同步成新 pid。
 	# stderr 的落点和 cluster_up.sh 一致：panic 只写 stderr，丢了就没有现场。
-	"${argv[@]}" >/dev/null 2>>"$ROOT_DATA/$killed/log/stderr.txt" &
+	"${argv[@]}" >/dev/null 2>>"$ROOT_DATA/$killed/$STDERR_REL" &
 	PID_OF[$killed]=$!
 	if ! wait_ready "${ADDR_OF[$killed]}" "$ROOT_DATA/$killed"; then
 		echo "第 $round 轮之后重启 $killed 失败，后续轮次不在 5 节点上跑" >&2

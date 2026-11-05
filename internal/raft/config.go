@@ -219,15 +219,26 @@ func parseLogLevel(s string) (zapcore.Level, error) {
 }
 
 // Load 解析 miniraft-node 的命令行：开关表见 3.1 §6，九项进 raft 的 Config，
-// `-batch-size` 透传给 kvstore，`-max-file-size` 与 `-log-level` 两边同一个值（只有一根开关）。
+// `-max-file-size` 与 `-log-level` 两边同一个值（只有一根开关）。
 // `-data-dir` 不给就按 `data/node-<id>` 推，`-addr` 不给就取 `-peers` 里本 id 那项（D8 的相对路径口径）。
-// `-raft-fsync` 只管 raft 日志，KV 的 WAL 仍按批次 Sync（D19 的对照要隔离的是每条 Sync 这一层）。
+// `-raft-fsync` 只管日志，合并之后它是写路径上唯一的数据 Sync（D19）。
 func Load(args []string) (Config, kvstore.Config, error) {
+	return load("miniraft-node", args, true)
+}
+
+// LoadSingleNode 解析 miniraft-kv 的命令行：成员表只有进程自己，`-peers` 与 `-node-id` 可省，
+// 地址取 `-addr`，数据目录默认 `data`（docs/8 §二 的单节点集群）。
+func LoadSingleNode(args []string) (Config, kvstore.Config, error) {
+	return load("miniraft-kv", args, false)
+}
+
+// memberTable 为真时成员表必须由命令行给；为假时用 `-addr` 现造一张只有自己的表。
+func load(name string, args []string, memberTable bool) (Config, kvstore.Config, error) {
 	cfg := DefaultConfig()
 	kcfg := kvstore.DefaultConfig()
 
 	var nodeID, peersFlag, addrFlag, dataDir, readMode string
-	fs := flag.NewFlagSet("miniraft-node", flag.ContinueOnError)
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&nodeID, "node-id", "", "member id, must appear in -peers")
 	fs.StringVar(&peersFlag, "peers", "", "member table, node-1=127.0.0.1:8801,node-2=...")
@@ -237,8 +248,7 @@ func Load(args []string) (Config, kvstore.Config, error) {
 	fs.Int64Var(&cfg.HeartbeatMS, "heartbeat-ms", cfg.HeartbeatMS, "leader heartbeat period, must be under T")
 	fs.Int64Var(&cfg.TickMS, "tick-ms", cfg.TickMS, "period the entry layer calls Tick() at")
 	fs.BoolVar(&cfg.Fsync, "raft-fsync", cfg.Fsync, "fsync every raft log batch; disable only for the throughput comparison")
-	fs.IntVar(&kcfg.BatchSize, "batch-size", kcfg.BatchSize, "kv wal records per fsync batch")
-	fs.Int64Var(&cfg.MaxFileSize, "max-file-size", cfg.MaxFileSize, "bytes per segment file before rollover, raft log and kv wal")
+	fs.Int64Var(&cfg.MaxFileSize, "max-file-size", cfg.MaxFileSize, "bytes per segment file before rollover")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "debug, info, warn, error, panic, fatal")
 	fs.StringVar(&readMode, "read-mode", string(cfg.ReadMode), "linearizable read path: lease or readindex")
 	fs.Int64Var(&cfg.ClockDriftMS, "clock-drift-ms", cfg.ClockDriftMS, "clock drift margin taken off the lease window")
@@ -248,13 +258,26 @@ func Load(args []string) (Config, kvstore.Config, error) {
 	}
 	cfg.ReadMode = ReadMode(readMode)
 
+	if !memberTable {
+		if nodeID == "" {
+			nodeID = "node-1"
+		}
+		if addrFlag == "" {
+			addrFlag = kvstore.DefaultAddr
+		}
+		peersFlag = nodeID + "=" + addrFlag
+	}
 	peers, err := parsePeers(peersFlag)
 	if err != nil {
 		return Config{}, kvstore.Config{}, err
 	}
 	cfg.NodeID, cfg.Peers = nodeID, peers
 	if dataDir == "" {
-		dataDir = filepath.Join(kvstore.DefaultDataDir, nodeID)
+		if memberTable {
+			dataDir = filepath.Join(kvstore.DefaultDataDir, nodeID)
+		} else {
+			dataDir = kvstore.DefaultDataDir
+		}
 	}
 	if addrFlag == "" {
 		addrFlag = peers[nodeID]
@@ -264,8 +287,6 @@ func Load(args []string) (Config, kvstore.Config, error) {
 	}
 	cfg.DataDir = dataDir
 	kcfg.DataDir, kcfg.Addr, kcfg.MaxFileSize, kcfg.LogLevel = dataDir, addrFlag, cfg.MaxFileSize, cfg.LogLevel
-	// 节点模式的 map 由日志回放重建，KV WAL 只写不读（docs/8 第 1 步）。
-	kcfg.SkipWALRecovery = true
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, kvstore.Config{}, err

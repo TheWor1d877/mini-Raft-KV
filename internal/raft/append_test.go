@@ -6,6 +6,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/TheWor1d877/mini-Raft-KV/internal/kvstore"
 )
 
 // termPtr 给 AppendReply.ConflictTerm 取值；nil 就是 JSON 里的 null（3.1 §4）。
@@ -159,6 +161,66 @@ func TestAppendHeartbeatWithEmptyEntriesKeepsLocalLog(t *testing.T) {
 		if e, ok := n.log.entryAt(index); !ok || e.term != want {
 			t.Errorf("index %d = %+v ok=%v, want it still there at term %d", index, e, ok, want)
 		}
+	}
+}
+
+// 合并之后日志是状态的唯一来源：截掉已经 apply 的位置，会把 map 里的一段赋值留在日志之外，
+// 重启的游标校验也救不回来（docs/8 §六）。更高任期的 Leader 也越不过这条界：
+// 整条请求拒掉，日志、游标与状态机一个字不动，但任期照收（不变式 5 先于第 5 步）。
+// 同一个 prevLogIndex 的心跳不截任何东西，照收——判据是「带条目」，不是位置本身。
+func TestAppendRefusesToTruncateAnAppliedPosition(t *testing.T) {
+	core, logs := observer.New(zapcore.InfoLevel)
+	c := newCluster(t, 1, zap.New(core))
+	command, err := kvstore.EncodeEntry("k", "v")
+	if err != nil {
+		t.Fatalf("encode the seeded command: %v", err)
+	}
+	n := c.reseed("node-1",
+		State{CurrentTerm: 2, CommitIndex: 1, LastApplied: 1},
+		[]seedEntry{{term: 2, index: 1, cmd: string(command)}, {term: 2, index: 2}, {term: 2, index: 3}})
+
+	if got := n.Stats(); got.CommitIndex != 1 || got.LastApplied != 1 || got.LastLogIndex != 3 {
+		t.Fatalf("fixture stats = %+v, want both cursors at the applied write with three entries on disk", got)
+	}
+	if value, err := c.kv("node-1").Get("k"); err != nil || value != "v" {
+		t.Fatalf("recovered value = %q (%v), want v: index 1 is the applied write this test protects", value, err)
+	}
+
+	reply := n.handleAppendEntries(AppendRequest{
+		Term: 3, LeaderID: "node-9", PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries: []LogEntry{{Term: 3, Index: 1, Command: []byte("overwrite")}},
+	})
+	if reply.Success || reply.Term != 3 {
+		t.Fatalf("reply = %+v, want a refusal that still carries the adopted term 3", reply)
+	}
+	if reply.ConflictTerm != nil || reply.ConflictIndex != 2 {
+		t.Errorf("conflict hint = %v/%d, want null/2: the Leader can only resume past the applied cursor",
+			reply.ConflictTerm, reply.ConflictIndex)
+	}
+	if got := n.log.length(); got != 3 {
+		t.Fatalf("log length = %d, want the three seeded entries untouched", got)
+	}
+	if e, ok := n.log.entryAt(1); !ok || e.term != 2 || string(e.cmd) != string(command) {
+		t.Errorf("index 1 = %+v ok=%v, want the applied write still there at term 2", e, ok)
+	}
+	if got := n.Stats(); got.CommitIndex != 1 || got.LastApplied != 1 || got.Term != 3 {
+		t.Errorf("stats after the refusal = %+v, want the cursors kept at 1 with term 3 adopted", got)
+	}
+	if value, err := c.kv("node-1").Get("k"); err != nil || value != "v" {
+		t.Errorf("value after the refusal = %q (%v), want v", value, err)
+	}
+	if got := logs.FilterMessage("append refused: would truncate an applied position").Len(); got != 1 {
+		t.Errorf("refusal log lines = %d, want 1: %+v", got, logs.FilterMessage("append refused*").All())
+	}
+
+	beat := n.handleAppendEntries(AppendRequest{
+		Term: 3, LeaderID: "node-9", PrevLogIndex: 0, PrevLogTerm: 0, Entries: []LogEntry{},
+	})
+	if !beat.Success {
+		t.Errorf("heartbeat at prevLogIndex 0 = %+v, want it accepted: only a request with entries truncates", beat)
+	}
+	if got := n.log.length(); got != 3 {
+		t.Errorf("log length after the heartbeat = %d, want 3", got)
 	}
 }
 

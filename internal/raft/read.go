@@ -253,6 +253,10 @@ func (n *Node) scheduleReadRound() {
 	for _, peerID := range n.cfg.otherPeers() {
 		n.appendOnce(peerID)
 	}
+	// 成员表只有自己的时候没有回执可等：自票已经凑够多数派，当场结算（docs/8 §二 的单节点集群）。
+	if round.acks >= n.cfg.Majority() {
+		n.settleReadRound(round)
+	}
 }
 
 // countReadRound 给在途确认轮计一票（4.1 §7 回执计票）。

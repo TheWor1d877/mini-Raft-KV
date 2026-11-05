@@ -12,6 +12,10 @@ LEVEL="${3:-info}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT_DATA="${2:-$ROOT/data}"
 BIN="$ROOT/bin/miniraft-node"
+# 进程日志与 stderr 的落点只有这一处口径（3.1 §6 末段：一个进程一份 miniraft-node.log）。
+LOG_DIR_REL="log"
+LOG_REL="$LOG_DIR_REL/miniraft-node.log"
+STDERR_REL="$LOG_DIR_REL/stderr.txt"
 if [[ ! -x "$BIN" ]]; then
 	echo "找不到 $BIN，先跑：go build -o bin/miniraft-node ./cmd/miniraft-node" >&2
 	exit 1
@@ -51,7 +55,7 @@ wait_ready() {
 		sleep 0.05
 	done
 	echo "node 在 $addr 上没有就绪" >&2
-	tail -5 "$dir/log/miniraft-node.log" >&2 || true
+	tail -5 "$dir/$LOG_REL" >&2 || true
 	return 1
 }
 
@@ -60,10 +64,10 @@ for ((i = 1; i <= NODES; i++)); do
 	id="node-$i"
 	addr="127.0.0.1:$((PORT0 + i - 1))"
 	dir="$ROOT_DATA/$id"
-	mkdir -p "$dir/log"
+	mkdir -p "$dir/$LOG_DIR_REL"
 	# 节点的运行日志全在 miniraft-node.log 里，stdout 必须丢掉：留着管道口，调用方的 `| tail` 之类的就永远等不到 EOF。
 	# stderr 单独收进 log/stderr.txt：panic 和 Go runtime 的 fatal 只走 stderr，丢了就没有现场。
-	"$BIN" -node-id "$id" -peers "$PEERS" -data-dir "$dir" -log-level "$LEVEL" >/dev/null 2>>"$dir/log/stderr.txt" &
+	"$BIN" -node-id "$id" -peers "$PEERS" -data-dir "$dir" -log-level "$LEVEL" >/dev/null 2>>"$dir/$STDERR_REL" &
 	pid=$!
 	if ! wait_ready "$addr" "$dir"; then
 		# 已经起来的节点留在这儿，清单里也留着：排查完用同一条 cluster_down.sh 收。

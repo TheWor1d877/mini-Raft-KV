@@ -1,15 +1,13 @@
 package raft
 
 import (
-	"context"
-
 	"go.uber.org/zap"
 
 	"github.com/TheWor1d877/mini-Raft-KV/internal/kvstore"
 )
 
-// apply 每攒够这么多条已提交条目调一次 kv.Flush，与 kvstore 的批次大小同值：
-// 一批 apply 落一次 KV WAL 的 fsync（3.1 §7）。
+// apply 每攒够这么多条写一次 state 游标：状态机改动只落内存，
+// 这个边界只决定游标落盘的频率（docs/8 §二）。
 const maxApplyEntries = 64
 
 // advanceCommit 按不变式 3 推进 commitIndex：只因为「当前任期的条目被多数派复制」而前进，
@@ -41,8 +39,8 @@ func (n *Node) replicaCount(index uint64) int {
 }
 
 // applyCommitted 把 (lastApplied, commitIndex] 应用进 KV 状态机（不变式 4）。
-// 内存游标只在 kv.Flush 成功之后才动：Flush 失败时游标与 state 文件都停在上一批的边界上，
-// 下一轮从同一位置重试，重复 apply 由 KV 的幂等兜住（D4）。调用方必须持锁。
+// 状态机改动只动内存：数据的落盘边界在日志追加那次 Sync 上已经定下，apply 之后只写 state 游标。
+// 重复 apply 由赋值的幂等兜住（D4）。调用方必须持锁。
 func (n *Node) applyCommitted() error {
 	pending := 0
 	for index := n.lastApplied + 1; index <= n.commitIndex; index++ {
@@ -55,9 +53,7 @@ func (n *Node) applyCommitted() error {
 			if err != nil {
 				return err
 			}
-			if err := n.kv.Put(context.Background(), key, value); err != nil {
-				return err
-			}
+			n.kv.Apply(key, value)
 		}
 		n.lg.Debug("entry applied",
 			zap.String("node_id", n.cfg.NodeID),
@@ -79,17 +75,16 @@ func (n *Node) applyCommitted() error {
 	return nil
 }
 
-// finishApply 是一批 apply 的提交点，顺序不能换：KV 落盘 → 游标进内存并写回 state →
-// 兑现这一段上的客户端等待。state 文件里 commitIndex 与 lastApplied 同批重写（不变式 4）。
+// finishApply 是一批 apply 的提交点，顺序不能换：状态机改动已经在调用方落到内存 →
+// 游标进内存并写回 state → 兑现这一段上的客户端等待。
+// state 文件里只有游标，数据的落盘边界在日志追加的那次 Sync 上，所以游标落盘失败时
+// 这一批照常兑现，错误只作为「apply failed」记进日志：盘上的游标停在旧边界，
+// 重启从那里回放会把已经生效的条目再 apply 一遍，赋值的幂等兜住（D4）。
+// 方向不能反：state 里的 lastApplied 永远不许领先于状态机真正应用的位置。
 func (n *Node) finishApply(through uint64) error {
-	if err := n.kv.Flush(); err != nil {
-		return err
-	}
 	previous := n.lastApplied
 	n.lastApplied = through
-	if err := n.state.store(n.currentState()); err != nil {
-		return err
-	}
+	storeErr := n.state.store(n.currentState())
 	n.wakeApplyWaiters(through)
 	for index := previous + 1; index <= through; index++ {
 		if ch, ok := n.proposals[index]; ok {
@@ -97,7 +92,7 @@ func (n *Node) finishApply(through uint64) error {
 			delete(n.proposals, index)
 		}
 	}
-	return nil
+	return storeErr
 }
 
 // wakeApplyWaiters 兑现 applyWaiters 里读索引不超过 through 的那些格（4.1 §8 不变式 1）。

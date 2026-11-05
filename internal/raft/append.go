@@ -97,6 +97,19 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 	// 5：带条目时才截掉 prevLogIndex 之后的本地后缀，再按序追加，Sync 成功才许回 success=true。
 	// 空数组的心跳不截：它只确认位置，删日志的是带条目的那一次（3.1 §7 第 5 步）。
 	if len(req.Entries) > 0 {
+		// 合并之后日志是状态的唯一来源：截掉已经 apply 的位置，map 里就留下一段
+		// 日志解释不了的赋值，重启的游标校验也救不回来（docs/8 §六）。
+		// 整条请求拒掉、日志与游标都不动；回退提示指向 lastApplied+1，
+		// Leader 只有从已应用的位置往后接才可能过这一关。
+		if req.PrevLogIndex < n.lastApplied {
+			n.lg.Warn("append refused: would truncate an applied position",
+				zap.String("node_id", n.cfg.NodeID),
+				zap.String("leader_id", req.LeaderID),
+				zap.Uint64("term", n.term),
+				zap.Uint64("prev_log_index", req.PrevLogIndex),
+				zap.Uint64("last_applied", n.lastApplied))
+			return n.rejectAppend(nil, n.lastApplied+1, req.ReadRound)
+		}
 		if err := n.log.truncateTo(req.PrevLogIndex); err != nil {
 			return AppendReply{Term: n.term, Success: false, ReadRound: req.ReadRound}
 		}

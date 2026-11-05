@@ -3,14 +3,12 @@ package kvstore
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 )
 
@@ -26,33 +24,18 @@ func openKV(t *testing.T, cfg Config) (*KV, *observer.ObservedLogs) {
 	return k, records
 }
 
+// 日志进内存 observer，级别放到 debug：Apply 的记录就在 debug 档。
+func observerLogger() (*zap.Logger, *observer.ObservedLogs) {
+	core, records := observer.New(zapcore.DebugLevel)
+	return zap.New(core), records
+}
+
 func kvConfig(t *testing.T) Config {
 	t.Helper()
 	cfg := DefaultConfig()
 	cfg.DataDir = t.TempDir()
 	cfg.LogLevel = "debug"
 	return cfg
-}
-
-func mustPut(t *testing.T, k *KV, key, value string) {
-	t.Helper()
-	if err := k.Put(context.Background(), key, value); err != nil {
-		t.Fatalf("Put(%q,%q) = %v", key, value, err)
-	}
-}
-
-// 按 §6 的段序把盘上的记录全部读回来，用于和 map 对账。
-func recordsOnDisk(t *testing.T, cfg Config) [][2]string {
-	t.Helper()
-	segs, err := listSegments(cfg)
-	if err != nil {
-		t.Fatalf("listSegments = %v", err)
-	}
-	var out [][2]string
-	for _, s := range segs {
-		out = append(out, readRecords(t, s.path)...)
-	}
-	return out
 }
 
 func TestGetMissingKeyIsErrKeyNotFound(t *testing.T) {
@@ -69,11 +52,10 @@ func TestGetMissingKeyIsErrKeyNotFound(t *testing.T) {
 
 // 空串 key、空串 value 都是合法写入，且与「不存在」区分得开（D4）。
 func TestEmptyKeyAndEmptyValueAreDistinctFromAbsent(t *testing.T) {
-	cfg := kvConfig(t)
-	k, _ := openKV(t, cfg)
+	k, _ := openKV(t, kvConfig(t))
 
-	mustPut(t, k, "", "")
-	mustPut(t, k, "empty-value", "")
+	k.Apply("", "")
+	k.Apply("empty-value", "")
 
 	for _, key := range []string{"", "empty-value"} {
 		value, err := k.Get(key)
@@ -85,183 +67,93 @@ func TestEmptyKeyAndEmptyValueAreDistinctFromAbsent(t *testing.T) {
 		}
 	}
 	if _, err := k.Get("never-written"); !errors.Is(err, ErrKeyNotFound) {
-		t.Errorf("absent key after two empty-value puts = %v", err)
-	}
-
-	if err := k.Close(); err != nil {
-		t.Fatalf("Close = %v", err)
-	}
-	reopened, _ := openKV(t, cfg)
-	if value, err := reopened.Get(""); err != nil || value != "" {
-		t.Errorf("after restart Get(\"\") = %q, %v", value, err)
+		t.Errorf("absent key after two empty-value applies = %v", err)
 	}
 }
 
-// 同 key 同 value 重放十次，终态与一次相同；WAL 里十次都留着，重放后仍然一致。
-func TestReplayingSamePutIsIdempotent(t *testing.T) {
-	cfg := kvConfig(t)
-	k, _ := openKV(t, cfg)
+// 同 key 同 value 重放十次再改一次值，终态与「只写最后一笔」相同：
+// Apply 是纯内存赋值，重复回放没有副作用（docs/8 §二，恢复与补 apply 都能从头再来）。
+func TestReplayingSameApplyIsIdempotent(t *testing.T) {
+	k, _ := openKV(t, kvConfig(t))
 
 	for i := 0; i < 10; i++ {
-		mustPut(t, k, "k1", "v1")
+		k.Apply("k1", "v1")
 	}
-	mustPut(t, k, "k1", "v2")
+	for i := 0; i < 11; i++ {
+		k.Apply("k1", "v2")
+	}
+	if value, err := k.Get("k1"); err != nil || value != "v2" {
+		t.Fatalf("k1 = %q, %v, want v2", value, err)
+	}
+
+	// 从头再来一遍同序回放，终态逐 key 相同（D4 的幂等口径）。
+	fresh, _ := openKV(t, kvConfig(t))
 	for i := 0; i < 10; i++ {
-		mustPut(t, k, "k1", "v2")
+		fresh.Apply("k1", "v1")
 	}
-	if err := k.Close(); err != nil {
-		t.Fatalf("Close = %v", err)
+	for i := 0; i < 11; i++ {
+		fresh.Apply("k1", "v2")
 	}
-
-	if got := recordsOnDisk(t, cfg); len(got) != 21 {
-		t.Fatalf("wal holds %d records, want every replay appended", len(got))
-	}
-	reopened, _ := openKV(t, cfg)
-	if value, err := reopened.Get("k1"); err != nil || value != "v2" {
-		t.Fatalf("after restart k1 = %q, %v, want v2", value, err)
-	}
-	if err := reopened.Close(); err != nil {
-		t.Fatalf("Close = %v", err)
-	}
-	third, _ := openKV(t, cfg)
-	if value, err := third.Get("k1"); err != nil || value != "v2" {
-		t.Errorf("second restart k1 = %q, %v, want v2", value, err)
+	if value, err := fresh.Get("k1"); err != nil || value != "v2" {
+		t.Errorf("replayed from scratch k1 = %q, %v, want v2", value, err)
 	}
 }
 
-// 超限在编码层就拒掉：不落字节、不改 map。
-func TestOversizedKeyAndValueRejected(t *testing.T) {
-	cfg := kvConfig(t)
-	k, _ := openKV(t, cfg)
-
-	if err := k.Put(context.Background(), strings.Repeat("k", MaxKeySize+1), "v"); !errors.Is(err, ErrTooLarge) {
-		t.Errorf("oversized key = %v, want ErrTooLarge", err)
-	}
-	if err := k.Put(context.Background(), "k", strings.Repeat("v", MaxValueSize+1)); !errors.Is(err, ErrTooLarge) {
-		t.Errorf("oversized value = %v, want ErrTooLarge", err)
-	}
-	if got := recordsOnDisk(t, cfg); len(got) != 0 {
-		t.Errorf("oversized puts left %d records on disk", len(got))
-	}
-	for _, key := range []string{strings.Repeat("k", MaxKeySize+1), "k"} {
-		if _, err := k.Get(key); !errors.Is(err, ErrKeyNotFound) {
-			t.Errorf("Get(%q) after a rejected put = %v", key, err)
-		}
-	}
-
-	// 恰好上限必须能写进去，否则上面两条拒的是合法输入。
-	mustPut(t, k, strings.Repeat("k", MaxKeySize), strings.Repeat("v", MaxValueSize))
-	if got := recordsOnDisk(t, cfg); len(got) != 1 {
-		t.Errorf("boundary put recorded %d times", len(got))
-	}
-}
-
-// 追加失败：不更新 map、不产生记录，之后重启与盘上一致。
-func TestPutFailureLeavesMapUnchanged(t *testing.T) {
-	cfg := kvConfig(t)
-	k, records := openKV(t, cfg)
-
-	mustPut(t, k, "k1", "v1")
-	if err := k.Flush(); err != nil {
-		t.Fatalf("Flush = %v", err)
-	}
-	restore := makeWALWriteFail(t, k.wal)
-
-	var errno syscall.Errno
-	err := k.Put(context.Background(), "k2", "v2")
-	if !errors.Is(err, ErrIO) {
-		t.Fatalf("Put with a broken wal fd = %v, want ErrIO", err)
-	}
-	if !errors.As(err, &errno) || errno != syscall.EBADF {
-		t.Errorf("errno = %v, want EBADF in the error chain", errno)
-	}
-	if _, err := k.Get("k2"); !errors.Is(err, ErrKeyNotFound) {
-		t.Errorf("k2 visible after a failed put: %v", err)
-	}
-	if v, err := k.Get("k1"); err != nil || v != "v1" {
-		t.Errorf("k1 = %q, %v after a failed put, want v1", v, err)
-	}
-	if got := recordsOnDisk(t, cfg); len(got) != 1 {
-		t.Errorf("disk holds %d records after a failed put, want 1", len(got))
-	}
-	if n := records.FilterMessage("put rejected").Len(); n != 1 {
-		t.Errorf("put rejected logged %d times, want 1", n)
-	}
-	restore()
-	if err := k.Close(); err != nil {
-		t.Fatalf("Close = %v", err)
-	}
-	reopened, _ := openKV(t, cfg)
-	if v, err := reopened.Get("k1"); err != nil || v != "v1" {
-		t.Errorf("after restart k1 = %q, %v, want v1", v, err)
-	}
-	if _, err := reopened.Get("k2"); !errors.Is(err, ErrKeyNotFound) {
-		t.Errorf("the failed put came back after restart: %v", err)
-	}
-}
-
-// Put 的 op_seq 与 Debug 日志里的 req_id 一一对上（2.1 §8）。
-func TestPutLogsReqIDAndOpSeq(t *testing.T) {
+// Apply 的 debug 日志带 key（截断）、value_len 与指纹，component 是 kv（2.1 §8）。
+func TestApplyLogsEntryApplied(t *testing.T) {
 	k, records := openKV(t, kvConfig(t))
+	k.Apply("k1", "v1")
 
-	if err := k.Put(WithRequestID(context.Background(), "req-42"), "k1", "v1"); err != nil {
-		t.Fatalf("Put = %v", err)
-	}
-	entries := records.FilterMessage("put applied").All()
+	entries := records.FilterMessage("entry applied").All()
 	if len(entries) != 1 {
-		t.Fatalf("put applied logged %d times", len(entries))
+		t.Fatalf("entry applied logged %d times, want 1", len(entries))
 	}
 	fields := entries[0].ContextMap()
-	if fields["req_id"] != "req-42" {
-		t.Errorf("req_id = %v, want req-42", fields["req_id"])
-	}
-	if fields["op_seq"] != uint64(1) {
-		t.Errorf("op_seq = %v, want 1", fields["op_seq"])
-	}
 	if fields["component"] != ComponentKV {
 		t.Errorf("component = %v, want %q", fields["component"], ComponentKV)
 	}
-
-	// 超限在编码层就拒掉，不进写路径，也就不该有「put rejected」。
-	if err := k.Put(WithRequestID(context.Background(), "req-99"), strings.Repeat("a", MaxKeySize+1), "v"); !errors.Is(err, ErrTooLarge) {
-		t.Fatalf("oversized put = %v, want ErrTooLarge", err)
+	if fields["key"] != "k1" || fields["value_len"] != int64(2) {
+		t.Errorf("fields = %v, want key k1 and value_len 2", fields)
 	}
-	if n := records.FilterMessage("put rejected").Len(); n != 0 {
-		t.Errorf("an oversized put logged %d write failures", n)
+	if fp, ok := fields["value_fp"].(string); !ok || len(fp) != 8 {
+		t.Errorf("value_fp = %v, want an 8-hex-digit fingerprint", fields["value_fp"])
 	}
-
-	// 追加失败也要带 req_id，否则排查时串不起一次请求。
-	restore := makeWALWriteFail(t, k.wal)
-	if err := k.Put(WithRequestID(context.Background(), "req-77"), "k2", "v2"); err == nil {
-		t.Fatalf("put on a broken wal fd succeeded")
-	}
-	failed := records.FilterMessage("put rejected").All()
-	if len(failed) != 1 {
-		t.Fatalf("put rejected logged %d times, want 1", len(failed))
-	}
-	if got := failed[0].ContextMap()["req_id"]; got != "req-77" {
-		t.Errorf("failure log req_id = %v, want req-77", got)
-	}
-	restore()
 }
 
-// Close 落掉未满的一批并释放目录锁；重启能拿到锁并读回全部写入。
-func TestCloseFlushesAndReleasesLock(t *testing.T) {
+// req_id 在 context 里进出：入口放进去，写路径的失败日志取出来（2.1 §8）。
+func TestRequestIDRoundTripsThroughContext(t *testing.T) {
+	ctx := WithRequestID(context.Background(), "req-42")
+	if got := RequestID(ctx); got != "req-42" {
+		t.Errorf("RequestID = %q, want req-42", got)
+	}
+	if got := RequestID(context.Background()); got != "" {
+		t.Errorf("RequestID on a bare ctx = %q, want empty", got)
+	}
+	if got := RequestID(nil); got != "" {
+		t.Errorf("RequestID(nil) = %q, want empty", got)
+	}
+}
+
+// Close 只释放目录锁：状态机不落盘，重启后的 map 是空的，
+// 数据由 raft 日志回放重建（docs/8 §二）。
+func TestCloseReleasesLockAndReopensEmpty(t *testing.T) {
 	cfg := kvConfig(t)
-	cfg.BatchSize = 1000
 	k, _ := openKV(t, cfg)
 
 	for i := 0; i < 5; i++ {
-		mustPut(t, k, fmt.Sprintf("k%d", i), "v")
+		k.Apply("k", "v")
 	}
 	if err := k.Close(); err != nil {
 		t.Fatalf("Close = %v", err)
 	}
-	if _, err := Open(cfg, zap.NewNop()); err != nil {
-		t.Fatalf("second Open after Close = %v, want the lock released", err)
+
+	reopened, _ := openKV(t, cfg)
+	if _, err := reopened.Get("k"); !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("KV holds data after restart: %v, want an empty map for the log to replay", err)
 	}
-	if got := recordsOnDisk(t, cfg); len(got) != 5 {
-		t.Errorf("disk holds %d records after Close, want 5", len(got))
+	reopened.Apply("k", "v2")
+	if v, err := reopened.Get("k"); err != nil || v != "v2" {
+		t.Errorf("apply after restart = %q, %v, want v2", v, err)
 	}
 }
 
@@ -288,19 +180,18 @@ func TestOpenOnLockedDirReturnsErrLocked(t *testing.T) {
 // Open 的非法配置不建目录、不留半把锁。
 func TestOpenRejectsInvalidConfig(t *testing.T) {
 	cfg := kvConfig(t)
-	cfg.BatchSize = 0
-	dir := cfg.DataDir
+	cfg.Addr = ""
 
 	lg, records := observerLogger()
 	if _, err := Open(cfg, lg); err == nil {
-		t.Fatalf("Open with batch size 0 succeeded")
-	} else if !errors.Is(err, ErrIO) && !strings.Contains(err.Error(), "batch size") {
+		t.Fatal("Open with an empty listen addr succeeded")
+	} else if !strings.Contains(err.Error(), "listen addr") {
 		t.Errorf("Open err = %v, want the config complaint", err)
 	}
 	if n := records.FilterMessage("open failed").Len(); n != 1 {
 		t.Errorf("open failure logged %d times, want 1", n)
 	}
-	if _, err := os.Stat(filepath.Join(dir, LockFileName)); err == nil {
-		t.Errorf("invalid config created the lock file in %s", dir)
+	if _, err := os.Stat(cfg.LockPath()); err == nil {
+		t.Errorf("invalid config created the lock file at %s", cfg.LockPath())
 	}
 }

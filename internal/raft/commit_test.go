@@ -50,10 +50,10 @@ func TestCommitCarriesOldTermEntriesOnlyIndirectly(t *testing.T) {
 	}
 }
 
-// 当选那一轮的 no-op 提交推进 commitIndex；command 为空的条目跳过 KV，
-// 但游标照走——KV 的 WAL 一个字节都没有（3.1 §7 应用、D4）。
+// 当选那一轮的 no-op 提交推进 commitIndex；command 为空的条目跳过状态机，
+// 但游标照走——日志里那一帧仍在，状态机一个字节都没改（3.1 §7 应用、D4）。
 func TestApplyMovesCursorWithoutWritingEmptyEntries(t *testing.T) {
-	c, n, _ := leaderFixture(t)
+	_, n, logs := leaderFixture(t)
 
 	if e, ok := n.log.entryAt(2); !ok || len(e.cmd) != 0 {
 		t.Fatalf("index 2 = %+v ok=%v, want the no-op the fixture committed", e, ok)
@@ -64,8 +64,8 @@ func TestApplyMovesCursorWithoutWritingEmptyEntries(t *testing.T) {
 	if got, err := n.Get("k"); !errors.Is(err, kvstore.ErrKeyNotFound) || got != "" {
 		t.Errorf("Get(k) = %q %v, want nothing in the state machine", got, err)
 	}
-	if size := fileSize(t, c.kvCfg["node-1"].WALPath(1)); size != 0 {
-		t.Errorf("kv wal bytes = %d, want 0: an empty command never reaches the KV", size)
+	if got := logs.FilterMessage("entry applied").FilterField(zap.String("component", "kv")).Len(); got != 0 {
+		t.Errorf("state machine applies = %d, want 0: an empty command never reaches Apply", got)
 	}
 }
 
@@ -99,81 +99,111 @@ func TestApplyRunsInIndexOrderAndFeedsKV(t *testing.T) {
 	}
 }
 
-// 一批的提交点是 kv.Flush：这批里只有空 command 的条目，Put 一步都不走，失败只能来自 Flush。
-// 这时内存游标与 state 文件都必须停在上一批的边界上（不变式 4）。
-// 这条专门杀「Flush 成功之前就把 lastApplied 写回 state」那处变异（3.2 §6）。
-func TestFlushFailureKeepsLastAppliedOffState(t *testing.T) {
+// 合并之后一批的提交点只剩 state 游标写：数据的持久边界在日志追加的那次 Sync 上，
+// 状态机改动只落内存。所以游标落盘失败时这一批照常生效，盘上的游标停在上一批的边界（不变式 4）。
+// 这条专门杀「state 落盘排到状态机改动之前，失败就不 apply」那处变异：
+// 那样这一条的值进不了 map，而日志与回执已经把它当成功（docs/8 §二、§六）。
+func TestCursorWriteFailureStillAppliesTheEntry(t *testing.T) {
 	c, n, logs := leaderFixture(t)
 	before := n.Stats()
+	command, err := kvstore.EncodeEntry("k", "v")
+	if err != nil {
+		t.Fatalf("encode the command: %v", err)
+	}
 
-	c.breakKV("node-1")
+	c.breakStateStore("node-1")
 	n.mu.Lock()
-	mustAppend(t, n.log, n.term, before.LastLogIndex+1, "")
+	mustAppend(t, n.log, n.term, before.LastLogIndex+1, string(command))
 	n.matchIndex["node-2"] = before.LastLogIndex + 1
 	n.matchIndex["node-3"] = before.LastLogIndex + 1
 	n.advanceCommit()
-	err := n.applyCommitted()
-	got := Stats{CommitIndex: n.commitIndex, LastApplied: n.lastApplied}
+	committed := n.commitIndex
 	n.mu.Unlock()
 
-	if !errors.Is(err, kvstore.ErrIO) {
-		t.Fatalf("applyCommitted = %v, want ErrIO from the failed flush", err)
+	// 提交点走生产路径那一条：Tick 末尾的 apply 撞上游标写失败，日志里留下 apply failed。
+	n.Tick()
+	got := n.Stats()
+	if got.CommitIndex != committed || committed != before.LastLogIndex+1 {
+		t.Fatalf("commitIndex = %d, want %d: replication is not what failed", got.CommitIndex, before.LastLogIndex+1)
 	}
-	if got.CommitIndex != before.LastLogIndex+1 {
-		t.Errorf("commitIndex = %d, want %d: replication is not what failed", got.CommitIndex, before.LastLogIndex+1)
+	if count := countLogs(logs, "apply failed"); count < 1 {
+		t.Errorf("apply failed entries = %d, want at least 1: %+v", count, logs.FilterMessage("apply failed").All())
 	}
-	if got.LastApplied != before.LastApplied {
-		t.Errorf("lastApplied = %d, want it kept at %d", got.LastApplied, before.LastApplied)
+	if got.LastApplied != before.LastLogIndex+1 {
+		t.Errorf("lastApplied = %d, want the in-memory cursor to follow the state machine", got.LastApplied)
+	}
+	if value, err := n.Get("k"); err != nil || value != "v" {
+		t.Errorf("Get(k) = %q %v, want the applied value readable: the entry is durable in the log", value, err)
 	}
 	disk, err := newStateFile(c.raftCfg["node-1"], zap.NewNop()).load()
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
 	if disk.LastApplied != before.LastApplied {
-		t.Errorf("state file lastApplied = %d, want %d: nothing written before Flush succeeded",
+		t.Errorf("state file lastApplied = %d, want it kept at %d: the write failed, the lag is harmless",
 			disk.LastApplied, before.LastApplied)
 	}
-	// 失败之后节点照常跑：Tick 末尾与每条 success 回执都会再撞一次 Flush，
-	// 日志里至少有一条 apply failed（3.1 §10 的下游链）。
-	n.Tick()
-	if count := countLogs(logs, "apply failed"); count < 1 {
-		t.Errorf("apply failed entries = %d, want at least 1: %+v", count, logs.FilterMessage("apply failed").All())
-	}
 
-	// 重启补 apply：同一条已提交的条目从上一批的边界重试一次就追平（3.1 §7 启动）。
-	recovered := c.recover("node-1")
-	if got := recovered.Stats(); got.LastApplied != got.CommitIndex || got.LastApplied != before.LastLogIndex+1 {
-		t.Errorf("stats after recovery = %+v, want both cursors at %d", got, before.LastLogIndex+1)
+	// 游标写不进去的节点不是正常退出：Close 的落 state 那一步把 ErrIO 报出来（3.1 §4 的 Close 行）。
+	if err := c.stopNode("node-1"); !errors.Is(err, kvstore.ErrIO) {
+		t.Errorf("close with an unpersistable cursor = %v, want ErrIO", err)
+	}
+	c.start("node-1")
+	recovered := c.node("node-1")
+
+	// 盘上的游标停在旧边界，那条已经生效过的条目就此退回「在日志里、没应用」那一格：
+	// apply 的内存结果不落盘就不算数，重启只看得到 state 与日志这两个文件（不变式 4）。
+	if got := recovered.Stats(); got.LastApplied != before.LastApplied || got.LastLogIndex != before.LastLogIndex+1 {
+		t.Fatalf("stats after restart = %+v, want the cursor at %d with %d entries in the log",
+			got, before.LastApplied, before.LastLogIndex+1)
+	}
+	// Leader 的心跳把提交边界重新推过来：同一条日志再走一次 apply，值与游标都回来了。
+	recovered.handleAppendEntries(AppendRequest{
+		Term: recovered.Stats().Term, LeaderID: "node-4",
+		PrevLogIndex: before.LastLogIndex + 1, PrevLogTerm: 3,
+		LeaderCommit: before.LastLogIndex + 1,
+	})
+	if got := recovered.Stats(); got.LastApplied != before.LastLogIndex+1 || got.CommitIndex != got.LastApplied {
+		t.Errorf("stats after the leader re-committed it = %+v, want both cursors at %d", got, before.LastLogIndex+1)
+	}
+	if value, err := recovered.Get("k"); err != nil || value != "v" {
+		t.Errorf("Get(k) after the re-apply = %q %v, want the value back", value, err)
 	}
 	disk, err = newStateFile(c.raftCfg["node-1"], zap.NewNop()).load()
 	if err != nil {
-		t.Fatalf("load state after recovery: %v", err)
+		t.Fatalf("load state after the re-apply: %v", err)
 	}
 	if disk.LastApplied != before.LastLogIndex+1 {
 		t.Errorf("state file lastApplied = %d, want %d after the catch-up apply", disk.LastApplied, before.LastLogIndex+1)
 	}
 }
 
-// 写路径关掉之后，客户端那条链拿到的是 ErrIO：条目已复制、已提交，但进不了状态机（D5 的下游）。
-func TestProposeFailsWhenStateMachineIsClosed(t *testing.T) {
+// 日志的写路径关掉之后，客户端那条链拿到的是 ErrIO：追加这一步就失败，
+// 条目没进日志，也就没有提交与 apply（D5）。读路径与已经生效的写照常。
+func TestProposeFailsWhenTheLogIsDisabled(t *testing.T) {
 	c, n, _ := leaderFixture(t)
 	before := n.Stats()
+	putOne(t, n, "warm", "value")
 
-	c.breakKV("node-1")
+	c.breakLog("node-1")
 	_, _, err := n.Propose(context.Background(), "k", "v")
 	if !errors.Is(err, kvstore.ErrIO) {
-		t.Fatalf("propose against a closed kv = %v, want ErrIO", err)
+		t.Fatalf("propose against a disabled log = %v, want ErrIO", err)
+	}
+	if !n.writeDisabled() {
+		t.Error("writeDisabled = false, want the failure to stay latched")
 	}
 	got := n.Stats()
 	if got.CommitIndex != before.CommitIndex+1 {
-		t.Errorf("commitIndex = %d, want %d: the entry replicated and committed anyway",
+		t.Errorf("commitIndex = %d, want %d: the warm write committed normally, the refused one not at all",
 			got.CommitIndex, before.CommitIndex+1)
 	}
-	if got.LastApplied != before.LastApplied {
-		t.Errorf("lastApplied = %d, want it kept at %d", got.LastApplied, before.LastApplied)
-	}
 	if value, err := n.Get("k"); err == nil || value != "" {
-		t.Errorf("Get(k) = %q %v, want the write invisible until it reaches the state machine", value, err)
+		t.Errorf("Get(k) = %q %v, want nothing: the refused entry never reached the log", value, err)
+	}
+	// 失效只关写：读路径照常，已经生效的值还在（D5 的下游）。
+	if value, err := n.Get("warm"); err != nil || value != "value" {
+		t.Errorf("Get(warm) after the failure = %q %v, want the read path untouched", value, err)
 	}
 }
 
@@ -240,35 +270,35 @@ func waitApplyWaiter(t *testing.T, n *Node) {
 	}
 }
 
-// Flush 失败的那一批里 lastApplied 不动，落在该批上的线性读不返回成功：
-// 它挂在 applyWaiters 上等 apply 兑现，等到超时才走，日志里留下三个游标（4.1 §8 第一条、D27、4.2 §3 的 commit 行）。
-func TestLinearReadWaitsOnTheApplyThatFailedToFlush(t *testing.T) {
-	c, n, logs := leaderFixture(t)
+// 已提交的条目解不出 KV 操作时，apply 停在这一条之前：游标不动、兑现不发生，
+// 落在它上面的线性读只能挂在 applyWaiters 上等，等到超时才走，日志里留下三个游标
+// （4.1 §8 第一条、D27、4.2 §3 的 commit 行）。
+// 这条同时是「解不出来就跳过」那处变异的杀手：跳过会把游标推到读索引之后，
+// 读于是拿到旧值还回成功，而客户端已经把这一条当成写进去了。
+func TestLinearReadWaitsOnAnApplyThatCannotDecode(t *testing.T) {
+	_, n, logs := leaderFixture(t)
 	putOne(t, n, "k", "v")
 	before := n.Stats()
 
-	c.breakKV("node-1")
-	command, err := kvstore.EncodeEntry("k2", "v2")
-	if err != nil {
-		t.Fatalf("encode the command: %v", err)
-	}
 	n.mu.Lock()
-	mustAppend(t, n.log, n.term, before.LastLogIndex+1, string(command))
+	mustAppend(t, n.log, n.term, before.LastLogIndex+1, "\x01\x00")
 	n.matchIndex["node-2"] = before.LastLogIndex + 1
 	n.matchIndex["node-3"] = before.LastLogIndex + 1
 	n.advanceCommit()
-	applyErr := n.applyCommitted()
 	stats := Stats{CommitIndex: n.commitIndex, LastApplied: n.lastApplied}
 	n.mu.Unlock()
 
-	if !errors.Is(applyErr, kvstore.ErrIO) {
-		t.Fatalf("applyCommitted = %v, want ErrIO from the failed flush", applyErr)
+	// 提交点走生产路径：Tick 末尾的 apply 撞上坏 command，日志里留下 apply failed。
+	n.Tick()
+	if count := countLogs(logs, "apply failed"); count < 1 {
+		t.Errorf("apply failed entries = %d, want at least 1: %+v", count, logs.FilterMessage("apply failed").All())
 	}
-	if stats.LastApplied != before.LastApplied {
-		t.Fatalf("lastApplied = %d, want it kept at %d", stats.LastApplied, before.LastApplied)
+	if got := n.Stats(); got.LastApplied != before.LastApplied {
+		t.Fatalf("lastApplied = %d, want it kept at %d: the batch that cannot decode never commits",
+			got.LastApplied, before.LastApplied)
 	}
 
-	// 这条读落在失败的那一批上：读索引是 commitIndex，lastApplied 还停在上一批的边界上。
+	// 这条读落在卡住的那一段上：读索引是 commitIndex，lastApplied 还停在上一批的边界。
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -303,25 +333,37 @@ func TestLinearReadWaitsOnTheApplyThatFailedToFlush(t *testing.T) {
 	if fields["commit_index"] != uint64(stats.CommitIndex) {
 		t.Errorf("commit_index = %v, want %d", fields["commit_index"], stats.CommitIndex)
 	}
+}
 
-	// 恢复补 apply 之后，同一个读请求立刻成功：值是补 apply 之后才进状态机的那一条。
-	recovered := c.recover("node-1")
-	if got := recovered.Stats(); got.LastApplied != got.CommitIndex {
-		t.Fatalf("stats after the recovery = %+v, want both cursors together", got)
+// 单节点集群的写不靠任何回执：replicaCount 恒计自己那一票，Majority()=1，
+// Propose 追加之后当场推进提交点，同一次调用里就 apply 兑现（docs/8 §二）。
+// 去掉 Propose 里那次 advanceCommit，提交点停在 0，这条写等不到 apply，只能按取消退出。
+func TestSingleNodeCommitNeedsNoReplicaReply(t *testing.T) {
+	c := newCluster(t, 1, zap.NewNop())
+	n := c.node("node-1")
+
+	runElection(t, n)
+	if got := n.Stats(); got.Role != RoleLeader || got.CommitIndex != 1 || got.LastApplied != 1 {
+		t.Fatalf("stats after the self-election = %+v, want leader with both cursors at the index-1 no-op", got)
 	}
-	c.injectVotes("node-1", grant(4), grant(4), deny(4), deny(4))
-	runElection(t, recovered)
-	if got := recovered.Role(); got != RoleLeader {
-		t.Fatalf("role after the second election = %s, want leader", got)
+	if got := len(c.calls("node-1")); got != 0 {
+		t.Errorf("RPCs sent by the one-member node = %d, want 0: the self-election has nobody to ask", got)
 	}
-	value, index, _, err := recovered.Read(context.Background(), "k2", ConsistencyLinearizable)
+
+	// 上界只给 5 秒：提交点不推进时这条 Propose 会一直等回调，
+	// 没有超时的话用例是挂死而不是失败。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	index, _, err := n.Propose(ctx, "k", "v")
 	if err != nil {
-		t.Fatalf("read after the recovery: %v", err)
+		t.Fatalf("propose on a one-member table: %v", err)
 	}
-	if value != "v2" {
-		t.Errorf("value = %q, want v2", value)
+	stats := n.Stats()
+	if stats.CommitIndex != index || stats.LastApplied != index {
+		t.Fatalf("cursors after the write = %+v, want both at index %d with no reply in flight", stats, index)
 	}
-	if index < recovered.Stats().LastApplied {
-		t.Errorf("read index = %d, want it at least at the applied cursor %d", index, recovered.Stats().LastApplied)
+	value, err := c.kv("node-1").Get("k")
+	if err != nil || value != "v" {
+		t.Errorf("read back = %q (%v), want v", value, err)
 	}
 }

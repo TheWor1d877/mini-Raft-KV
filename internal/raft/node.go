@@ -409,7 +409,8 @@ func (n *Node) transition(role Role, term uint64, votedFor, reason string) error
 }
 
 // becomeCandidate 递增 term、把票投给自己、重置选举截止，然后给其余成员各排一条投票。
-// 自票计入多数派（3.1 §7）。
+// 自票计入多数派（3.1 §7）；成员表只有自己时这一票当场就是多数派，选举在发起的那一拍结束，
+// 不必等一条永远不会回来的回执（docs/8 §二 的单节点集群）。
 func (n *Node) becomeCandidate() {
 	if err := n.transition(RoleCandidate, n.term+1, n.cfg.NodeID, "election timeout"); err != nil {
 		return
@@ -426,6 +427,9 @@ func (n *Node) becomeCandidate() {
 	}
 	for _, peerID := range n.cfg.otherPeers() {
 		n.outbox = append(n.outbox, rpcTask{peerID: peerID, vote: &req})
+	}
+	if n.votes >= n.cfg.Majority() {
+		n.becomeLeader("self-vote is a majority")
 	}
 }
 
@@ -471,6 +475,8 @@ func (n *Node) becomeLeader(reason string) {
 			zap.String("node_id", n.cfg.NodeID), zap.Uint64("term", n.term), zap.Error(err))
 		return
 	}
+	// 单成员表的多数派是 1，这条 no-op 当场就够数；多成员仍等回执（3.1 §4）。
+	n.advanceCommit()
 	n.broadcastAppends()
 }
 
@@ -549,6 +555,9 @@ func (n *Node) Propose(ctx context.Context, key, value string) (uint64, uint64, 
 		return 0, 0, err
 	}
 	wait := n.registerProposal(index)
+	// 自己这一票恒计入 replicaCount，成员表只有自己时多数派已经凑够，
+	// 当场推进提交点；多成员时这一句什么也不做，仍等回执。
+	n.advanceCommit()
 	n.broadcastAppends()
 	n.mu.Unlock()
 
@@ -614,7 +623,7 @@ func (n *Node) cancelProposals(err error) {
 	}
 }
 
-// Close 依次关掉在途提案、Flush KV、落 state、关 raft 日志（3.1 §4）。
+// Close 依次关掉在途提案、作废租约、落 state、关日志（3.1 §4）。
 func (n *Node) Close() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -626,7 +635,7 @@ func (n *Node) Close() error {
 	n.cancelProposals(ErrCanceled)
 	n.invalidateLease("closed", ErrCanceled)
 
-	err := n.kv.Flush()
+	var err error
 	if storeErr := n.state.store(n.currentState()); storeErr != nil {
 		err = errors.Join(err, storeErr)
 	}

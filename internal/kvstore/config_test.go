@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// 缺省值必须等于 2.1 §6 的目录布局与 §8 的批次、级别。
+// 缺省值必须等于 2.1 §6 的目录布局与 §8 的级别；批次与 fsync 开关随 KV WAL 一起取消（docs/8 §二）。
 func TestDefaultConfigMatchesSpec(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -14,14 +14,8 @@ func TestDefaultConfigMatchesSpec(t *testing.T) {
 	if cfg.Addr != "127.0.0.1:8742" {
 		t.Errorf("Addr = %q, want 127.0.0.1:8742", cfg.Addr)
 	}
-	if cfg.BatchSize != 64 {
-		t.Errorf("BatchSize = %d, want 64", cfg.BatchSize)
-	}
 	if cfg.MaxFileSize != 100<<20 {
 		t.Errorf("MaxFileSize = %d, want 100MB", cfg.MaxFileSize)
-	}
-	if cfg.Fsync != true {
-		t.Error("Fsync must default to true")
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want info", cfg.LogLevel)
@@ -29,11 +23,8 @@ func TestDefaultConfigMatchesSpec(t *testing.T) {
 
 	paths := map[string][2]string{
 		"lock": {cfg.LockPath(), "data/LOCK"},
-		"wal":  {cfg.WALDir(), "data/wal"},
 		"log":  {cfg.LogDir(), "data/log"},
 		"文件":   {cfg.LogPath(), "data/log/miniraft-kv.log"},
-		"序号1":  {cfg.WALPath(1), "data/wal/00000001.wal"},
-		"临时":   {cfg.WALTmpPath(1), "data/wal/00000001.wal.tmp"},
 	}
 	for name, p := range paths {
 		if p[0] != p[1] {
@@ -54,7 +45,7 @@ func TestDefaultsComeFromOnePlace(t *testing.T) {
 	if fromLoad != DefaultConfig() {
 		t.Errorf("Load(nil) = %+v, want %+v", fromLoad, DefaultConfig())
 	}
-	if DefaultConfig().BatchSize != DefaultBatchSize || DefaultConfig().MaxFileSize != DefaultMaxFileSize {
+	if DefaultConfig().MaxFileSize != DefaultMaxFileSize {
 		t.Error("DefaultConfig must read the exported default constants")
 	}
 }
@@ -63,27 +54,20 @@ func TestLoadOverridesFlags(t *testing.T) {
 	cfg, err := Load([]string{
 		"-data-dir", "/tmp/mini-raft",
 		"-addr", "127.0.0.1:19999",
-		"-batch-size", "1",
 		"-max-file-size", "4096",
-		"-fsync=false",
 		"-log-level", "debug",
 	})
 	if err != nil {
 		t.Fatalf("Load = %v", err)
 	}
 	if cfg.DataDir != "/tmp/mini-raft" || cfg.Addr != "127.0.0.1:19999" ||
-		cfg.BatchSize != 1 || cfg.MaxFileSize != 4096 || cfg.Fsync != false || cfg.LogLevel != "debug" {
+		cfg.MaxFileSize != 4096 || cfg.LogLevel != "debug" {
 		t.Errorf("overrides not applied: %+v", cfg)
-	}
-	if cfg.WALDir() != "/tmp/mini-raft/wal" {
-		t.Errorf("WALDir = %q, want /tmp/mini-raft/wal", cfg.WALDir())
 	}
 }
 
 func TestLoadRejectsInvalidValues(t *testing.T) {
 	cases := map[string][]string{
-		"负批次":    {"-batch-size", "-1"},
-		"零批次":    {"-batch-size", "0"},
 		"空目录":    {"-data-dir", ""},
 		"空监听地址":  {"-addr", ""},
 		"非正文件大小": {"-max-file-size", "0"},

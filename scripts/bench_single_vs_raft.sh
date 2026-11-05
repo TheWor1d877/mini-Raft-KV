@@ -1,18 +1,28 @@
 #!/usr/bin/env bash
-# 单机 KV 与 Raft 的写吞吐对照：同一份负载打三档，D21（单机 baseline）与 D19（每条 Sync）的差值从这里算。
+# 单节点集群与 5 节点集群的写吞吐对照：同一份负载打三档，D19（每条 Sync）与单机开销的差值从这里算。
 # 用法：scripts/bench_single_vs_raft.sh [写入条数=2000] [起始端口=8901] [数据根目录=data/bench]
-# 三档：kv-batch64  单进程 miniraft-kv，默认批次 64、每批一次 Sync（2.1 的交付物）
-#       raft-fsync  5 进程 miniraft-node，每条 raft 日志 Sync
-#       raft-nofsync 同上但 -raft-fsync=false：只跳过 raft 日志的 Sync，KV 的 WAL 仍按批次
+# 三档：single-node-fsync 单进程 miniraft-kv，即单节点 raft 集群：成员表只有自己，
+#                       等满一个选举截止自票当选，写路径每条一次 Sync（docs/8 §二）
+#       raft-fsync        5 进程 miniraft-node，每条 raft 日志 Sync
+#       raft-nofsync      同上但 -raft-fsync=false：只跳过 raft 日志的 Sync
+# 档位名从 kv-batch64 改成 single-node-fsync：KV WAL 与「每 64 条一次 Sync」随合并一起取消，
+# 档 1 现在跑的是 raft 的写路径，读数背上 raft 的帧头（8 字节帧头 + op/term/index），与旧口径不同。
+# D21 的旧基线数字已经作废，合并后要在这三档上重跑，本脚本不再抄一份数字进来。
 # 口径：单客户端、串行写、一条一个 HTTP 请求、复用同一条连接（curl 每请求起进程的话，
-#       进程开销会盖掉 fsync 的差，D21 的对照就不成立了）。
+#       进程开销会盖掉 fsync 的差，对照就不成立了）。
 # 每档用全新的数据目录，互不继承；stdout 每档一行 mode writes acked elapsed_ms ops_per_sec p50_ms p99_ms。
 # 本文件同时是 scripts/bench_read_modes.sh 的公共库：被 source 时只定义函数、不跑主流程，
 # 所以 start_raft_cluster、make_payloads、stop_all 这些只写一份。
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_REL="log/miniraft-node.log"
+# 目录名与扩展名各收在这里：step 4 改名（raft/log→raft/wal、.rlog→.wal）只动下面两行。
+SEG_DIR_REL="raft/log"
+SEG_EXT="rlog"
+# 进程日志与 stderr 的落点只有这一处口径（3.1 §6 末段：一个进程一份 miniraft-node.log）。
+LOG_DIR_REL="log"
+LOG_REL="$LOG_DIR_REL/miniraft-node.log"
+STDERR_REL="$LOG_DIR_REL/stderr.txt"
 KV_VAL_LEN=128
 BIN_KV="$ROOT/bin/miniraft-kv"
 BIN_NODE="$ROOT/bin/miniraft-node"
@@ -83,6 +93,20 @@ wait_ready() { # $1 = addr，$2 = 数据目录，$3 = 日志相对路径
 	return 1
 }
 
+# 等本节点真的当上 Leader：成员表只有自己时多数派是 1，但进程起来先停在 Follower，
+# 要等满一个选举截止（[T,2T) = 500~1000ms）才自票当选（docs/8 §二）。
+# 判据用缺省档的 /get：Follower 一律 503，Leader 上这个 key 不存在是 404（D24）。
+# 不等这一条，客户端头几百个请求会成串拿 503，档位对照就变成在测选举窗口。
+wait_leader() { # $1 = addr
+	local addr="$1" code
+	for _ in $(seq 1 600); do
+		code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://$addr/get?key=__probe__" || true)"
+		[[ "$code" == "404" || "$code" == "200" ]] && return 0
+		sleep 0.05
+	done
+	return 1
+}
+
 # 现任 Leader：各节点最后一条 role changed 里 term 最大的那个 leader。
 find_leader() { # $1 = 集群根目录，$2 = 节点 id 列表（空格分隔）
 	local base="$1" id line ts term role best_term=-1 best_ns=-1 best_id="" ns
@@ -119,10 +143,10 @@ start_raft_cluster() { # $1 = 目录前缀，$2 = fsync 参数（空或 -raft-fs
 		id="node-$i"
 		addr="127.0.0.1:$((PORT0 + i - 1))"
 		dir="$ROOT_DATA/$prefix/$id"
-		mkdir -p "$dir/log"
+		mkdir -p "$dir/$LOG_DIR_REL"
 		# 每档自己的端口段，8801 上那套 cluster_up.sh 起的集群不受影响。
 		"$BIN_NODE" -node-id "$id" -peers "$peers" -data-dir "$dir" -log-level info \
-			$fsync_flag ${extra[@]+"${extra[@]}"} >/dev/null 2>>"$dir/log/stderr.txt" &
+			$fsync_flag ${extra[@]+"${extra[@]}"} >/dev/null 2>>"$dir/$STDERR_REL" &
 		RAFT_PIDS+=("$!")
 		wait_ready "$addr" "$dir" "$LOG_REL" || return 1
 	done
@@ -155,7 +179,7 @@ stop_all() {
 	KV_PID=""
 }
 
-report() { # $1 = mode，$2 = json，$3 = wal 字节，$4 = raft 日志字节
+report() { # $1 = mode，$2 = json，$3 = wal 字节（KV WAL 取消后三档恒传 0，列位留着给 step 4），$4 = raft 日志字节
 	local acked elapsed ops p50 p99
 	acked="$(printf '%s' "$2" | jq -r .acked)"
 	elapsed="$(printf '%s' "$2" | jq -r .elapsed_ms)"
@@ -168,13 +192,27 @@ report() { # $1 = mode，$2 = json，$3 = wal 字节，$4 = raft 日志字节
 	fi
 }
 
+# 这一档的日志落了多少字节：段目录里没有 *.$SEG_EXT 就是没落盘，算跑失败。
+# KV WAL 与它的批次开关（-batch-size、-fsync）随合并一起取消，所以 wal_bytes 这一栏三档都回 0，
+# 全部日志字节记在 raftlog_bytes；step 4 把 raft/log 改名成 raft/wal 之后这一栏的归属再跟着改。
+seg_bytes() { # $1 = 节点数据目录
+	local dir="$1" n
+	n="$(find "$dir/$SEG_DIR_REL" -name "*.$SEG_EXT" 2>/dev/null | wc -l | tr -d ' ')"
+	if [[ "$n" == "0" ]]; then
+		echo "档 $dir 的 $SEG_DIR_REL 里没有 *.$SEG_EXT 段文件" >&2
+		return 1
+	fi
+	du -sb "$dir/$SEG_DIR_REL" | cut -f1
+}
+
 main() {
-	local b mode fsync_flag out wal_bytes raftlog_bytes payload_dir KV_ADDR
+	local b mode fsync_flag out raftlog_bytes payload_dir KV_ADDR SINGLE_MODE
 	# 这三个必须是全局：make_payloads／start_raft_cluster／report 都从全局取，
 	# 被 source 的 bench_read_modes.sh 用的也是同一套全局。
 	N="${1:-2000}"
 	PORT0="${2:-8901}"
 	ROOT_DATA="${3:-$ROOT/data/bench}"
+	SINGLE_MODE="single-node-fsync"
 
 	for b in "$BIN_KV" "$BIN_NODE"; do
 		if [[ ! -x "$b" ]]; then
@@ -188,20 +226,23 @@ main() {
 
 	printf 'mode\twrites\tacked\telapsed_ms\tops_per_sec\tp50_ms\tp99_ms\twal_bytes\traftlog_bytes\n'
 
-	# 档 1：单机 KV，默认批次 64、每批一次 Sync。
+	# 档 1：单节点 raft 集群（bin/miniraft-kv 的进程载体），成员表只有自己，
+	# 自票当选后写路径每条一次 Sync。单节点档 -node-id 与 -peers 可省，只给 -addr。
 	KV_ADDR="127.0.0.1:$((PORT0 + 9))"
-	rm -rf "$ROOT_DATA/kv"
-	mkdir -p "$ROOT_DATA/kv/log"
-	"$BIN_KV" -data-dir "$ROOT_DATA/kv" -addr "$KV_ADDR" -log-level info >/dev/null 2>>"$ROOT_DATA/kv/log/stderr.txt" &
+	rm -rf "$ROOT_DATA/$SINGLE_MODE"
+	mkdir -p "$ROOT_DATA/$SINGLE_MODE/$LOG_DIR_REL"
+	"$BIN_KV" -data-dir "$ROOT_DATA/$SINGLE_MODE" -addr "$KV_ADDR" -log-level info \
+		>/dev/null 2>>"$ROOT_DATA/$SINGLE_MODE/$STDERR_REL" &
 	KV_PID=$!
-	if ! wait_ready "$KV_ADDR" "$ROOT_DATA/kv" "log/miniraft-kv.log"; then
+	if ! wait_ready "$KV_ADDR" "$ROOT_DATA/$SINGLE_MODE" "$LOG_REL" || ! wait_leader "$KV_ADDR"; then
+		echo "$SINGLE_MODE 档没能选出 Leader" >&2
 		stop_all
 		rm -rf "$payload_dir"
 		exit 1
 	fi
-	out="$(run_client "$KV_ADDR" "$payload_dir")" || { echo "kv 档跑失败" >&2; stop_all; exit 1; }
-	wal_bytes="$(du -sb "$ROOT_DATA/kv/wal" | cut -f1)"
-	report kv-batch64 "$out" "$wal_bytes" 0
+	out="$(run_client "$KV_ADDR" "$payload_dir")" || { echo "$SINGLE_MODE 档跑失败" >&2; stop_all; exit 1; }
+	raftlog_bytes="$(seg_bytes "$ROOT_DATA/$SINGLE_MODE")" || { stop_all; rm -rf "$payload_dir"; exit 1; }
+	report "$SINGLE_MODE" "$out" 0 "$raftlog_bytes"
 	stop_all
 
 	# 档 2 与档 3：5 节点集群，端口段复用，数据目录各自一份。
@@ -218,9 +259,8 @@ main() {
 			exit 1
 		fi
 		out="$(run_client "$LEADER_ADDR" "$payload_dir")" || { echo "$mode 档跑失败（Leader $LEADER_ADDR）" >&2; stop_all; exit 1; }
-		wal_bytes="$(du -sb "$ROOT_DATA/$mode/$LEADER_ID/wal" | cut -f1)"
-		raftlog_bytes="$(du -sb "$ROOT_DATA/$mode/$LEADER_ID/raft/log" | cut -f1)"
-		report "$mode" "$out" "$wal_bytes" "$raftlog_bytes"
+		raftlog_bytes="$(seg_bytes "$ROOT_DATA/$mode/$LEADER_ID")" || { stop_all; rm -rf "$payload_dir"; exit 1; }
+		report "$mode" "$out" 0 "$raftlog_bytes"
 		echo "  $mode 的 Leader 是 $LEADER_ID（$LEADER_ADDR），5 个节点各写一份 raft 日志" >&2
 		stop_all
 	done

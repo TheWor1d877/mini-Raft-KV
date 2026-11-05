@@ -19,7 +19,9 @@ import (
 	"time"
 )
 
-// 进程级用例：真的起 cmd/miniraft-kv，发请求、kill -9、重启对账。
+// 进程级用例（T13 这条线）：真的起 cmd/miniraft-kv——现在是单节点 raft 集群——
+// 发请求、kill -9、重启对账。写路径每条一次 Sync（docs/8 §二），
+// 已确认的写一条都不许丢；KV WAL 的批次窗口（旧 D6）整体作废。
 // 慢，只在回归与注入实验里跑，`-short` 直接跳过（2.2 §1）。
 func skipProcessTest(t *testing.T) {
 	t.Helper()
@@ -92,17 +94,20 @@ type kvProcess struct {
 	cmd     *exec.Cmd
 	dataDir string
 	addr    string
-	logPath string
 	out     *bytes.Buffer
 	exited  bool
 }
 
-// 进程的日志只落文件、不落 stdout（2.1 §5），所以 cmd 的输出缓冲区在失败时恒为空。
-// 退出码 1 的原因（收尾超时、Close 失败、写路径失效）全在日志文件里，失败时必须把尾巴打出来。
+// 节点日志落在 <data-dir>/log/miniraft-node.log（docs/8 §二）；进程只往 stderr 打致命错误。
+// 退出码 1 的原因全在日志文件里，失败时必须把尾巴打出来。
+func (p *kvProcess) logPath() string {
+	return filepath.Join(p.dataDir, "log", "miniraft-node.log")
+}
+
 func (p *kvProcess) logTail(lines int) string {
-	data, err := os.ReadFile(p.logPath)
+	data, err := os.ReadFile(p.logPath())
 	if err != nil {
-		return fmt.Sprintf("<read %s: %v>", p.logPath, err)
+		return fmt.Sprintf("<read %s: %v>", p.logPath(), err)
 	}
 	all := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
 	if len(all) > lines {
@@ -128,8 +133,7 @@ func startKVProcessAt(t *testing.T, dataDir, addr string, extra ...string) *kvPr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start miniraft-kv: %v", err)
 	}
-	p := &kvProcess{t: t, cmd: cmd, dataDir: dataDir, addr: addr,
-		logPath: filepath.Join(dataDir, LogDirName, LogFileName), out: out}
+	p := &kvProcess{t: t, cmd: cmd, dataDir: dataDir, addr: addr, out: out}
 	t.Cleanup(func() {
 		if !p.exited {
 			_ = p.cmd.Process.Kill()
@@ -137,47 +141,103 @@ func startKVProcessAt(t *testing.T, dataDir, addr string, extra ...string) *kvPr
 		}
 	})
 	p.waitReady()
+	p.waitLeader()
 	return p
 }
 
+// 就绪判据：单节点进程以 Leader 身份答一次默认档（线性一致）/get。
+// 连不上、5xx（含 503 not_leader）都算没就绪——参照 scripts/crash_inject.sh 的 wait_ready，
+// 把「只认 handler 的答复」收紧成「只认 Leader 的答复」：写路径下一条就要用。轮询到超时为止，不睡固定时长。
 func (p *kvProcess) waitReady() {
 	p.t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get("http://" + p.addr + "/get?key=probe")
+		resp, err := client.Get(p.url("/get?key=probe"))
 		if err == nil {
-			resp.Body.Close()
-			return
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+				return
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	p.t.Fatalf("miniraft-kv never served on %s\nstdout:\n%s\nlast log lines:%s",
+	p.t.Fatalf("miniraft-kv never served a linearizable /get on %s\nstdout:\n%s\nlast log lines:%s",
 		p.addr, p.out.String(), p.logTail(20))
 }
 
 func (p *kvProcess) url(path string) string { return "http://" + p.addr + path }
 
-func (p *kvProcess) put(key, value string) (int, error) {
+// waitLeader 等到本节点自己当选。单节点集群的多数派是 1（docs/8 §二），
+// 但进程起来先停在 Follower，要等满一个选举截止才发起选举、自票胜出转 Leader，
+// 写路径用例的 /put 在这之前只会拿到 503 not_leader。
+// 判据用缺省档的线性一致读：Follower 一律 503，Leader 上 probe 这个 key 不存在是 404。
+func (p *kvProcess) waitLeader() {
+	p.t.Helper()
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(p.url("/get?key=probe"))
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	p.t.Fatalf("miniraft-kv never became the leader on %s\nstdout:\n%s\nlast log lines:%s",
+		p.addr, p.out.String(), p.logTail(20))
+}
+
+// put 发一次写并解析响应体：/put 成功回执带 index 与 term（docs/8 §二的 raft handler）。
+func (p *kvProcess) put(key, value string) (int, uint64, error) {
 	body, err := json.Marshal(map[string]string{"key": key, "value": value})
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	resp, err := http.Post(p.url("/put"), "application/json", bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode, nil
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return resp.StatusCode, 0, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, 0, nil
+	}
+	var reply struct {
+		OK    bool   `json:"ok"`
+		Index uint64 `json:"index"`
+	}
+	if err := json.Unmarshal(data, &reply); err != nil {
+		return resp.StatusCode, 0, fmt.Errorf("put reply %q is not the documented shape: %w", data, err)
+	}
+	if !reply.OK {
+		return resp.StatusCode, 0, fmt.Errorf("put reply has ok=false: %s", data)
+	}
+	return resp.StatusCode, reply.Index, nil
 }
 
 func (p *kvProcess) get(key string) (int, string, error) {
-	resp, err := http.Get(p.url("/get?key=" + key))
+	return p.getAt(key, "")
+}
+
+func (p *kvProcess) getLocal(key string) (int, string, error) {
+	return p.getAt(key, "&consistency=local")
+}
+
+func (p *kvProcess) getAt(key, consistency string) (int, string, error) {
+	resp, err := http.Get(p.url("/get?key=" + key + consistency))
 	if err != nil {
 		return 0, "", err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return 0, "", err
 	}
@@ -190,7 +250,7 @@ func (p *kvProcess) get(key string) (int, string, error) {
 	return resp.StatusCode, reply.Value, nil
 }
 
-// kill -9：不等收尾，批次里没落盘的记录由恢复窗口兜住（D6）。
+// kill -9：单节点写路径每条一次 Sync，已确认的写全部在盘上（docs/8 §二，旧 D6 作废）。
 func (p *kvProcess) kill9() {
 	p.t.Helper()
 	if err := p.cmd.Process.Kill(); err != nil {
@@ -237,9 +297,9 @@ func (p *kvProcess) terminateWithin(limit time.Duration) {
 			p.t.Fatalf("graceful shutdown took %s, over the %s limit\nstdout:\n%s\nlast log lines:%s",
 				elapsed, limit, p.out.String(), p.logTail(20))
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(15 * time.Second):
 		_ = p.cmd.Process.Kill()
-		p.t.Fatalf("no clean exit within 10s after SIGTERM\nstdout:\n%s\nlast log lines:%s",
+		p.t.Fatalf("no clean exit within 15s after SIGTERM\nstdout:\n%s\nlast log lines:%s",
 			p.out.String(), p.logTail(20))
 	}
 }
@@ -256,219 +316,183 @@ func (p *kvProcess) openSilentConn() net.Conn {
 	return c
 }
 
-// writeRange 写入 n 条互不相同的 key，返回服务端确认成功（2xx）的条数。
-func (p *kvProcess) writeRange(n int) int {
+// writeRange 写入 n 条互不相同的 key，要求逐条确认（2xx），并核对日志 index 严格递增。
+// 起点不钉死：当选 Leader 会在日志尾部追加一条 no-op（3.1 §4），第一条客户端写
+// 因此落在 index 2 上；重启的进程再当选又会多一条。本包只认「递增」，
+// 返回首尾两个 index，条数由调用方自己按 last-first+1 核。
+func (p *kvProcess) writeRange(n int) (uint64, uint64) {
 	p.t.Helper()
-	acked := 0
+	var first, last uint64
 	for i := 0; i < n; i++ {
-		code, err := p.put(fmt.Sprintf("k%04d", i), fmt.Sprintf("v%04d", i))
+		code, index, err := p.put(fmt.Sprintf("k%04d", i), fmt.Sprintf("v%04d", i))
 		if err != nil {
 			p.t.Fatalf("put %d: %v", i, err)
 		}
-		if code == http.StatusOK {
-			acked++
-			continue
+		if code != http.StatusOK {
+			p.t.Fatalf("put %d stopped with %d, want every write acked", i, code)
 		}
-		// 500 说明写路径已经关掉，这条和之后的都拿不到确认。
-		p.t.Logf("put %d stopped with %d", i, code)
-		return acked
+		if i == 0 {
+			first = index
+		} else if index != last+1 {
+			p.t.Fatalf("put %d landed at index %d, want %d: the acked writes must be contiguous", i, index, last+1)
+		}
+		last = index
 	}
-	return acked
+	return first, last
 }
 
-// 重启后逐个 key 对账：读到的必须是当初写进去的值，读不到的算丢写。
-func (p *kvProcess) reconcile(total int) int {
+// 重启后逐个 key 对账（本地档读）：读到的必须是当初写进去的值，读不到的算丢写。
+// 返回恢复条数与逐条值相等的断言一并完成——丢任何一条都直接 Fatalf。
+func (p *kvProcess) reconcile(total int) {
 	p.t.Helper()
-	recovered := 0
 	for i := 0; i < total; i++ {
 		key, want := fmt.Sprintf("k%04d", i), fmt.Sprintf("v%04d", i)
-		code, got, err := p.get(key)
+		code, got, err := p.getLocal(key)
 		if err != nil {
 			p.t.Fatalf("get %s: %v", key, err)
 		}
-		switch {
-		case code == http.StatusOK && got == want:
-			recovered++
-		case code == http.StatusNotFound:
-			// 没恢复：落在丢写窗口里。
-		default:
-			p.t.Errorf("%s: %d %q, want %q or 404", key, code, got, want)
+		if code != http.StatusOK || got != want {
+			p.t.Fatalf("after restart %s = %d %q, want 200 %q: an acked write was lost", key, code, got, want)
 		}
 	}
-	return recovered
 }
 
-func walDirFiles(t *testing.T, dataDir string) (segments, tmps []string) {
-	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dataDir, WALDirName))
+func (p *kvProcess) processLog() string {
+	p.t.Helper()
+	data, err := os.ReadFile(p.logPath())
 	if err != nil {
-		t.Fatalf("read wal dir: %v", err)
+		p.t.Fatalf("read the log file: %v", err)
 	}
-	for _, e := range entries {
-		switch {
-		case strings.HasSuffix(e.Name(), ".tmp"):
-			tmps = append(tmps, e.Name())
-		case strings.HasSuffix(e.Name(), ".wal"):
-			segments = append(segments, e.Name())
-		}
-	}
-	return segments, tmps
+	return string(data)
 }
 
-// 批次未满就 kill -9：丢写只可能落在最近 63 条里，且不许出现未确认的记录（D6）。
-func TestCrashInsideBatch(t *testing.T) {
+// servedLines 数某一类路由的成功访问日志行。就绪与选主的轮询都打在 /get 上，
+// 次数随选举快慢浮动，按路由分开数才不用替探测兜底。
+func servedLines(logText, route string) int {
+	var n int
+	for _, line := range strings.Split(logText, "\n") {
+		if strings.Contains(line, `"msg":"http request served"`) &&
+			strings.Contains(line, `"route":"`+route+`"`) {
+			n++
+		}
+	}
+	return n
+}
+
+// raft/state 的 JSON 游标：kvstore 不依 raft 包（会成循环），直接解析文件（docs/8 §二）。
+type raftStateDoc struct {
+	CurrentTerm uint64 `json:"currentTerm"`
+	VotedFor    string `json:"votedFor"`
+	CommitIndex uint64 `json:"commitIndex"`
+	LastApplied uint64 `json:"lastApplied"`
+}
+
+func readRaftState(t *testing.T, dataDir string) raftStateDoc {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dataDir, "raft", "state"))
+	if err != nil {
+		t.Fatalf("read raft/state: %v", err)
+	}
+	var st raftStateDoc
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatalf("raft/state is not the documented JSON: %v (raw %q)", err, data)
+	}
+	return st
+}
+
+func raftSegments(t *testing.T, dataDir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dataDir, "raft", "log"))
+	if err != nil {
+		t.Fatalf("read raft/log: %v", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".rlog") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// kill -9 之后已确认的写一条不少：写路径每条一次 Sync，旧「批次未满丢 0..63 条」的
+// D6 窗口不复存在（docs/8 §二）。同时钉住目录布局：没有 wal/、raft/log 有段、
+// raft/state 的 lastApplied 不小于确认过的条数。
+func TestCrashAfterAckedWritesLosesNothing(t *testing.T) {
 	skipProcessTest(t)
 	const total = 200
 	dataDir := t.TempDir()
 
 	p := startKVProcess(t, dataDir)
-	acked := p.writeRange(total)
-	if acked != total {
-		t.Fatalf("server acked %d of %d writes", acked, total)
+	first, acked := p.writeRange(total)
+	if acked-first+1 != uint64(total) {
+		t.Fatalf("acked writes span [%d,%d], want %d contiguous entries", first, acked, total)
+	}
+	if first != 2 {
+		t.Errorf("first acked write landed at index %d, want 2: index 1 is the election no-op", first)
 	}
 	p.kill9()
 
-	restarted := startKVProcess(t, dataDir)
-	recovered := restarted.reconcile(total)
-	if recovered < acked-DefaultBatchSize+1 {
-		t.Errorf("recovered %d of %d acked writes, lost %d, want at most %d (D6)",
-			recovered, acked, acked-recovered, DefaultBatchSize-1)
+	// 崩溃现场的目录账：KV WAL 已取消，日志与游标是唯一的持久层。
+	if _, err := os.Stat(filepath.Join(dataDir, "wal")); !os.IsNotExist(err) {
+		t.Errorf("a wal/ directory exists in %s: KV WAL was retired (docs/8 §二)", dataDir)
 	}
-	if recovered > acked {
-		t.Errorf("recovered %d records but only %d were acked: phantom writes", recovered, acked)
+	if got := raftSegments(t, dataDir); len(got) == 0 {
+		t.Error("no .rlog segment under raft/log after 200 acked writes")
 	}
-	t.Logf("kill -9 mid-batch: acked=%d recovered=%d lost=%d", acked, recovered, acked-recovered)
-}
-
-// 频繁换段时被杀：恢复只认文件名序，段数继续增长，记录不丢未确认的那部分。
-func TestCrashDuringRollover(t *testing.T) {
-	skipProcessTest(t)
-	dataDir := t.TempDir()
-
-	const total = 400
-	p := startKVProcess(t, dataDir, "-max-file-size", "512")
-	acked := p.writeRange(total)
-	p.kill9()
-
-	segments, tmps := walDirFiles(t, dataDir)
-	if len(segments) < 2 {
-		t.Fatalf("only %d segments after %d writes under a 512-byte limit", len(segments), acked)
+	st := readRaftState(t, dataDir)
+	if st.LastApplied < acked {
+		t.Errorf("lastApplied = %d after crash, want >= %d acked writes", st.LastApplied, acked)
 	}
-	restarted := startKVProcess(t, dataDir)
-	recovered := restarted.reconcile(total)
-	if recovered < acked-DefaultBatchSize+1 {
-		t.Errorf("recovered %d of %d acked writes, want at most %d lost", recovered, acked, DefaultBatchSize-1)
-	}
-	if recovered > acked {
-		t.Errorf("recovered %d records but only %d were acked", recovered, acked)
-	}
-	// 未提交的临时段必须被删掉，正式段一个都不能少。
-	_, afterTmps := walDirFiles(t, dataDir)
-	if len(afterTmps) != 0 {
-		t.Errorf("leftover *.tmp segments after restart: %v (before=%v)", afterTmps, tmps)
-	}
-	t.Logf("kill -9 across rollovers: acked=%d recovered=%d segments=%d stale_tmp=%d",
-		acked, recovered, len(segments), len(tmps))
-}
-
-// 上一次留下一个还没改名的临时段：恢复必须在扫描之前删掉它，不碰已提交的段，也不把序号推高。
-func TestLeftoverUncommittedSegment(t *testing.T) {
-	skipProcessTest(t)
-	dataDir := t.TempDir()
-	cfg := DefaultConfig()
-	cfg.DataDir = dataDir
-
-	first := startKVProcess(t, dataDir, "-max-file-size", "512")
-	if first.writeRange(20) != 20 {
-		t.Fatalf("setup writes were not acked")
-	}
-	// 用正常收尾把 20 条钉到盘上，本用例断的是残留临时段的处理，不是丢写窗口。
-	first.terminateWantClean()
-
-	segs, err := listSegments(cfg)
-	if err != nil {
-		t.Fatalf("listSegments = %v", err)
-	}
-	if len(segs) < 2 {
-		t.Fatalf("setup produced %d segments, want several", len(segs))
-	}
-	lastSeq := segs[len(segs)-1].seq
-
-	// 造一个「已创建、未改名」的残留，序号比真实最大段还大一档，里面还写着字节。
-	stale := filepath.Join(dataDir, WALDirName, fmt.Sprintf(WALTmpFileFormat, lastSeq+1))
-	if err := os.WriteFile(stale, []byte("000000"), 0o644); err != nil {
-		t.Fatalf("write leftover: %v", err)
+	if st.CommitIndex < acked {
+		t.Errorf("commitIndex = %d after crash, want >= %d acked writes", st.CommitIndex, acked)
 	}
 
 	restarted := startKVProcess(t, dataDir)
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Errorf("the uncommitted segment %s survived recovery (err=%v)", stale, err)
-	}
-	if got := restarted.reconcile(20); got != 20 {
-		t.Errorf("recovered %d of 20 records that were already durable", got)
-	}
-
-	// 接着写一条再正常收尾，检查恢复之后的追加与编号。
-	if code, err := restarted.put("after", "restart"); err != nil || code != http.StatusOK {
-		t.Fatalf("put after recovery = %d, %v", code, err)
+	restarted.reconcile(total)
+	// 默认档线性一致读在重启后的单节点 Leader 上照常服务。
+	if code, got, err := restarted.get("k0199"); err != nil || code != http.StatusOK || got != "v0199" {
+		t.Errorf("linearizable read after restart = %d %q %v, want 200 v0199", code, got, err)
 	}
 	restarted.terminateWantClean()
-	// 先看一眼临时段的总数：listSegments 自己会删 tmp，放在后面就测不出问题了。
-	if _, tmps := walDirFiles(t, dataDir); len(tmps) != 0 {
-		t.Errorf("temp segments left behind: %v", tmps)
-	}
-	after, err := listSegments(cfg)
-	if err != nil {
-		t.Fatalf("listSegments after restart = %v", err)
-	}
-
-	// 段号不许因为那个临时文件跳号：恢复删 tmp 在扫描之前，O_EXCL 也才腾得出名字。
-	if maxSeq := after[len(after)-1].seq; maxSeq > lastSeq+1 {
-		t.Errorf("highest segment is %d, want at most %d: the leftover tmp consumed a segment number", maxSeq, lastSeq+1)
-	}
-	for i, sg := range after {
-		if sg.seq != uint64(i+1) {
-			t.Errorf("segment %d is numbered %d, want a gapless run from 1", i, sg.seq)
-		}
-	}
 }
 
-// SIGTERM 走完整收尾：未满的一批被落盘，重启一条不丢，退出码为 0。
+// SIGTERM 走完整收尾：重启一条不丢，退出码 0，LOCK 文件仍在。
+// 日志字段口径（docs/8 §二）：入口行是 node started / node stopped，component=entry。
 func TestGracefulShutdownLosesNothing(t *testing.T) {
 	skipProcessTest(t)
 	const total = 100
 	dataDir := t.TempDir()
 
 	p := startKVProcess(t, dataDir)
-	acked := p.writeRange(total)
-	if acked != total {
-		t.Fatalf("server acked %d of %d", acked, total)
-	}
+	p.writeRange(total)
 	p.terminateWantClean()
 
-	restarted := startKVProcess(t, dataDir)
-	if got := restarted.reconcile(total); got != total {
-		t.Errorf("after a clean shutdown only %d of %d records came back", got, total)
-	}
 	if _, err := os.Stat(filepath.Join(dataDir, LockFileName)); err != nil {
 		t.Errorf("the lock file disappeared on shutdown: %v", err)
 	}
 
-	// 日志落在 data/log/ 下，入口行带 component=entry，且写进去的 value 一个都不许出现（2.1 §8）。
-	log := processLog(t, dataDir)
-	for _, want := range []string{`"msg":"server started"`, `"component":"entry"`, `"msg":"server stopped"`, `"exit_code":0`} {
-		if !strings.Contains(log, want) {
-			t.Errorf("log has no %s", want)
+	// 只数第一个进程的尾巴：重启进程紧接着会往同一份日志追加。
+	firstRun := p.processLog()
+	for _, want := range []string{`"msg":"node started"`, `"component":"entry"`, `"msg":"node stopped"`, `"exit_code":0`} {
+		if !strings.Contains(firstRun, want) {
+			t.Errorf("first run log has no %s%s", want, p.logTail(20))
 		}
 	}
 	for _, forbidden := range []string{"v0000", "v0099", `"value":"`} {
-		if strings.Contains(log, forbidden) {
+		if strings.Contains(firstRun, forbidden) {
 			t.Errorf("log leaks %q", forbidden)
 		}
 	}
-	if n := strings.Count(log, `"msg":"http request served"`); n != total*2 {
-		t.Errorf("access log has %d lines, want %d (one per request to this process)", n, total*2)
+	// 访问日志按路由分开数：/get 上的探测次数取决于选举要轮询几轮，不钉死；
+	// /put 的成功行必须一条写一行（2.1 §8）。
+	if n := servedLines(firstRun, "/put"); n != total {
+		t.Errorf("access log has %d served /put lines, want %d (one per acked write)", n, total)
 	}
+
+	restarted := startKVProcess(t, dataDir)
+	restarted.reconcile(total)
+	restarted.terminateWantClean()
 }
 
 // 只连不说话的连接占不住收尾窗口（2.1 §4）：net/http 把这种连接当忙连接，
@@ -480,14 +504,12 @@ func TestSilentConnectionDoesNotBlockShutdown(t *testing.T) {
 	dataDir := t.TempDir()
 
 	p := startKVProcess(t, dataDir)
-	if p.writeRange(total) != total {
-		t.Fatalf("setup writes were not all acked")
-	}
+	p.writeRange(total)
 	p.openSilentConn()
 	// 沉默连接光 dial 不算被受理：accept 循环按顺序收连接，所以让它随后服务一次全新拨号即可反证。
 	// keep-alive 必须关掉，否则这次请求可能复用旧连接，顺序就落不到 accept 上。
 	noKeep := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
-	resp, err := noKeep.Get(p.url("/get?key=probe"))
+	resp, err := noKeep.Get(p.url("/get?key=probe&consistency=local"))
 	if err != nil {
 		t.Fatalf("get after the silent dial: %v", err)
 	}
@@ -497,80 +519,99 @@ func TestSilentConnectionDoesNotBlockShutdown(t *testing.T) {
 	p.terminateWithin(4 * time.Second)
 
 	// 这条日志说明收尾确实关掉了沉默连接。条数不钉死：本用例自己的客户端也会留下受理完还没读的连接。
-	if !strings.Contains(processLog(t, dataDir), `"msg":"closed connections that never sent a request"`) {
-		t.Errorf("shutdown did not close any silent connection\nlast log lines:%s", p.logTail(6))
+	if !strings.Contains(p.processLog(), `"msg":"closed connections that never sent a request"`) {
+		t.Errorf("shutdown did not close any silent connection%s", p.logTail(6))
 	}
 
 	restarted := startKVProcess(t, dataDir)
-	if got := restarted.reconcile(total); got != total {
-		t.Errorf("after a shutdown with a silent connection, %d of %d records came back", got, total)
-	}
+	restarted.reconcile(total)
 	restarted.terminateWantClean()
 }
 
-func processLog(t *testing.T, dataDir string) string {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join(dataDir, LogDirName, LogFileName))
-	if err != nil {
-		t.Fatalf("read the log file: %v", err)
-	}
-	return string(data)
-}
-
-// 建新段被权限挡住时，进程只回 500，不自杀：这类失败盘上边界已知，不属于失效语义（D5）。
-func TestProcessSurvivesBlockedRollover(t *testing.T) {
+// 建新段被权限挡住时，进程只回 500，不自杀：raftLog 的失效只由 Sync 失败触发，
+// 建段失败不置失效（3.1 §7）。读路径继续服务，恢复写权限后追加照常（D5 新口径）。
+func TestProcessSurvivesBlockedSegmentCreation(t *testing.T) {
 	skipProcessTest(t)
 	dataDir := t.TempDir()
-	walDir := filepath.Join(dataDir, WALDirName)
-	// 一条 ("kNNNN","vNNNN") 的记录 27B：10 条正好 270B，下一条 29B 必然越过 280B 的段上限。
-	p := startKVProcess(t, dataDir, "-max-file-size", "280")
+	raftLogDir := filepath.Join(dataDir, "raft", "log")
+	// 一条 ("kNNNN","vNNNN") 记录 52B 帧：128B 的段上限让每隔两条滚一次段。
+	p := startKVProcess(t, dataDir, "-max-file-size", "128")
 
 	const total = 10
-	if p.writeRange(total) != total {
-		t.Fatalf("setup writes were not all acked")
+	p.writeRange(total)
+	if got := len(raftSegments(t, dataDir)); got < 2 {
+		t.Fatalf("setup wrote %d segments under a 128-byte cap, want rollover to have happened", got)
 	}
-	if segs, _ := walDirFiles(t, dataDir); len(segs) != 1 {
-		t.Fatalf("setup wrote %d segments, want the 11th record to be the one that rolls", len(segs))
-	}
-	if err := os.Chmod(walDir, 0o555); err != nil {
-		t.Fatalf("chmod wal dir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(walDir, 0o755) })
 
-	code, err := p.put("blocked", "value")
-	if err != nil {
-		t.Fatalf("put during a blocked rollover: %v", err)
+	if err := os.Chmod(raftLogDir, 0o555); err != nil {
+		t.Fatalf("chmod raft log dir: %v", err)
 	}
-	if code != http.StatusInternalServerError {
-		t.Errorf("put during a blocked rollover = %d, want 500", code)
+	restored := false
+	restore := func() {
+		if !restored {
+			if err := os.Chmod(raftLogDir, 0o755); err != nil {
+				t.Fatalf("restore chmod: %v", err)
+			}
+			restored = true
+		}
 	}
-	// 读路径必须还活着：进程没被这条错误带走。
+	t.Cleanup(restore)
+
+	// 当前段里塞得下的写照常确认；一旦越界要建新段就撞 EACCES。
+	// 循环到出现第一条 500 为止，段大小不由本包精确掌控，不赌第几条触发。
+	blockedAcked := 0
+	var rejectedKey string
+	for i := 0; i < 12; i++ {
+		key, value := fmt.Sprintf("b%04d", i), fmt.Sprintf("v%04d", i)
+		code, _, err := p.put(key, value)
+		if err != nil {
+			t.Fatalf("put %s during a blocked rollover: %v", key, err)
+		}
+		if code == http.StatusOK {
+			blockedAcked++
+			continue
+		}
+		if code == http.StatusInternalServerError {
+			rejectedKey = key
+			break
+		}
+		t.Fatalf("put %s during a blocked rollover = %d, want 200 or 500", key, code)
+	}
+	if rejectedKey == "" {
+		t.Fatalf("12 puts against a 555-mode raft log dir never forced a rollover")
+	}
+
+	// 读路径必须还活着，而且是默认档线性一致读：进程没被这条 500 带走。
 	if c, v, err := p.get("k0000"); err != nil || c != http.StatusOK || v != "v0000" {
 		t.Fatalf("read path after a blocked rollover = %d %q %v", c, v, err)
 	}
 
-	if err := os.Chmod(walDir, 0o755); err != nil {
-		t.Fatalf("restore chmod: %v", err)
-	}
-	if code, err := p.put("after", "block"); err != nil || code != http.StatusOK {
+	restore()
+	if code, _, err := p.put("after", "block"); err != nil || code != http.StatusOK {
 		t.Fatalf("put after the dir became writable again = %d, %v", code, err)
 	}
+	// 收尾退出码 0：一次建段失败不属于 D5 的失效语义，不该触发进程自杀。
 	p.terminateWantClean()
 
 	restarted := startKVProcess(t, dataDir)
-	if got := restarted.reconcile(total); got != total {
-		t.Errorf("recovered %d of %d records that were acked before the failure", got, total)
+	restarted.reconcile(total)
+	for i := 0; i < blockedAcked; i++ {
+		key, want := fmt.Sprintf("b%04d", i), fmt.Sprintf("v%04d", i)
+		if c, v, err := restarted.getLocal(key); err != nil || c != http.StatusOK || v != want {
+			t.Errorf("acked write %s during the block = %d %q %v after restart", key, c, v, err)
+		}
 	}
-	if c, _, err := restarted.get("blocked"); err != nil || c != http.StatusNotFound {
-		t.Errorf("the rejected put came back after restart: %d %v", c, err)
+	if c, _, err := restarted.getLocal(rejectedKey); err != nil || c != http.StatusNotFound {
+		t.Errorf("the rejected put %s came back after restart: %d %v", rejectedKey, c, err)
 	}
-	if c, v, err := restarted.get("after"); err != nil || c != http.StatusOK || v != "block" {
+	if c, v, err := restarted.getLocal("after"); err != nil || c != http.StatusOK || v != "block" {
 		t.Errorf("write after recovery = %d %q %v", c, v, err)
 	}
+	restarted.terminateWantClean()
 }
 
 // 地址被占时进程必须自己退掉，退出码 1，原因同时落日志和 stderr。
-// 只写日志文件的话，脚本侧只看得到「进程没了」，查不到为什么。
+// 起不来也要放掉目录锁，否则一次失败启动会把目录焊死。
 func TestProcessExitsWhenAddressIsTaken(t *testing.T) {
 	skipProcessTest(t)
 	dataDir := t.TempDir()
@@ -609,16 +650,14 @@ func TestProcessExitsWhenAddressIsTaken(t *testing.T) {
 	if !strings.Contains(out.String(), "listen") {
 		t.Errorf("stderr says nothing about the listen failure: %q", out.String())
 	}
-	logged := processLog(t, dataDir)
+	p := &kvProcess{t: t, dataDir: dataDir}
+	logged := p.processLog()
 	if !strings.Contains(logged, `"msg":"listen failed"`) {
-		t.Errorf("the log file has no listen failed line:\n%s", logged)
+		t.Errorf("the node log has no listen failed line:%s", p.logTail(10))
 	}
-	// 起不来也要把已经打开的 store 收尾：放掉 fd、留下 wal closed，不把目录停在半开状态。
-	if !strings.Contains(logged, `"msg":"wal closed"`) {
-		t.Errorf("the failed start left the store open:\n%s", logged)
-	}
+	// 旧格里「wal closed」随 KV WAL 取消：Close 现在只剩放锁与关日志，
+	// 是否真放了锁由下面的同目录重启证明。
 
-	// 失败路径也要把目录锁放掉，否则同一次启动失败会把目录焊死。
 	blockerAddr := blocker.Addr().String()
 	if err := blocker.Close(); err != nil {
 		t.Fatalf("release the address: %v", err)
@@ -627,4 +666,5 @@ func TestProcessExitsWhenAddressIsTaken(t *testing.T) {
 	if c, _, err := restarted.get("nothing"); err != nil || c != http.StatusNotFound {
 		t.Errorf("restart after a failed start = %d %v", c, err)
 	}
+	restarted.terminateWantClean()
 }

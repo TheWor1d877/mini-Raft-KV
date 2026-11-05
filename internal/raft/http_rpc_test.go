@@ -84,7 +84,6 @@ func newHTTPClusterCfg(t *testing.T, size int, lg *zap.Logger, mut func(*Config)
 		kcfg := kvstore.DefaultConfig()
 		kcfg.DataDir = cfg.DataDir
 		kcfg.MaxFileSize = cfg.MaxFileSize
-		kcfg.Fsync = cfg.Fsync
 
 		kv, err := kvstore.Open(kcfg, lg)
 		if err != nil {

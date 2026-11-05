@@ -331,7 +331,7 @@ func TestConfigValidateRejects(t *testing.T) {
 }
 
 // Load 是 miniraft-node 唯一的 flag 层（3.1 §6）：两个缺省值由成员表推，
-// 三处冲突一律报错，`-raft-fsync` 与 `-batch-size` 各落到自己的 Config。
+// 三处冲突一律报错，`-raft-fsync` 落在日志这一层。
 func TestConfigLoadFlags(t *testing.T) {
 	peers := "node-1=127.0.0.1:8801,node-2=127.0.0.1:8802"
 
@@ -372,6 +372,8 @@ func TestConfigLoadFlags(t *testing.T) {
 		"peer item without an equals sign":   {"-node-id", "node-1", "-peers", "node-1"},
 		"peer item with an empty address":    {"-node-id", "node-1", "-peers", "node-1=,node-2=127.0.0.1:8802"},
 		"heartbeat not shorter than T":       {"-node-id", "node-1", "-peers", peers, "-heartbeat-ms", "500"},
+		// KV WAL 并进日志之后批次开关没有对象了：这根开关整体取消，命令行里出现就是错（D6）。
+		"the batch size switch is gone": {"-node-id", "node-1", "-peers", peers, "-batch-size", "7"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := Load(args); err == nil {
@@ -380,21 +382,15 @@ func TestConfigLoadFlags(t *testing.T) {
 		})
 	}
 
-	// -raft-fsync 只管 raft 日志：KV 的 WAL 仍按批次 Sync，M13 的吞吐对照隔离的就是这一层（D19）。
-	t.Run("the two switches land on their own config", func(t *testing.T) {
-		cfg, kcfg, err := Load([]string{"-node-id", "node-2", "-peers", peers,
-			"-raft-fsync=false", "-batch-size", "7"})
+	// -raft-fsync 只管日志：合并之后写路径上的数据 Sync 只有这一处，
+	// state 游标的每批一次照常（D19，M13 的吞吐对照隔离的就是这一层）。
+	t.Run("the fsync switch lands on the log", func(t *testing.T) {
+		cfg, kcfg, err := Load([]string{"-node-id", "node-2", "-peers", peers, "-raft-fsync=false"})
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
 		if cfg.Fsync {
 			t.Error("raft Fsync = true, want -raft-fsync=false to reach it")
-		}
-		if !kcfg.Fsync {
-			t.Error("kv Fsync = false, want -raft-fsync to leave the WAL batching alone")
-		}
-		if kcfg.BatchSize != 7 {
-			t.Errorf("kv BatchSize = %d, want 7", kcfg.BatchSize)
 		}
 		if kcfg.Addr != "127.0.0.1:8802" {
 			t.Errorf("-addr default = %q, want node-2's entry", kcfg.Addr)
