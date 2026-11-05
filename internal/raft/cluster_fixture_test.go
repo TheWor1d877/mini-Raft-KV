@@ -166,6 +166,8 @@ func newClusterCfg(t *testing.T, size int, lg *zap.Logger, mut func(*Config)) *c
 		kcfg.DataDir = cfg.DataDir
 		kcfg.MaxFileSize = cfg.MaxFileSize
 		kcfg.Fsync = cfg.Fsync
+		// 与 raft.Load 一致：夹具里的 map 也从 raft 日志回放重建，不读 KV WAL。
+		kcfg.SkipWALRecovery = true
 		c.kvCfg[id] = kcfg
 		c.start(id)
 	}

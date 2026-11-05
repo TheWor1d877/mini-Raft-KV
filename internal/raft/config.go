@@ -264,6 +264,8 @@ func Load(args []string) (Config, kvstore.Config, error) {
 	}
 	cfg.DataDir = dataDir
 	kcfg.DataDir, kcfg.Addr, kcfg.MaxFileSize, kcfg.LogLevel = dataDir, addrFlag, cfg.MaxFileSize, cfg.LogLevel
+	// 节点模式的 map 由日志回放重建，KV WAL 只写不读（docs/8 第 1 步）。
+	kcfg.SkipWALRecovery = true
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, kvstore.Config{}, err

@@ -192,12 +192,43 @@ func NewNode(cfg Config, kv *kvstore.KV, tp Transport, lg *zap.Logger) (*Node, e
 		leaseWindow:    leaseWindow(cfg),
 	}
 	n.electionDeadline = n.rollElectionDeadline()
+	// 启动序列的第一步：map 由日志回放重建，KV WAL 不参与恢复（docs/8 第 1 步）。
+	if err := n.replayLog(); err != nil {
+		_ = n.log.close()
+		return nil, err
+	}
 	// 启动序列的最后一步：把已提交但没进状态机的条目补 apply（3.1 §7）。
 	if err := n.applyCommitted(); err != nil {
 		_ = n.log.close()
 		return nil, err
 	}
 	return n, nil
+}
+
+// replayLog 把 [1, lastApplied] 的条目重放进状态机。日志是唯一恢复源之后 map 由这里建起来，
+// (lastApplied, commitIndex] 交给 applyCommitted 补。
+// 游标指向的条目解不出 KV 操作就在启动期失败，不静默跳过（docs/8 §六）。
+func (n *Node) replayLog() error {
+	replayed := 0
+	for _, e := range n.log.entries {
+		if e.index > n.lastApplied {
+			break
+		}
+		if len(e.cmd) == 0 {
+			continue
+		}
+		key, value, err := kvstore.DecodeEntry(e.cmd, e.offset)
+		if err != nil {
+			return err
+		}
+		n.kv.Apply(key, value)
+		replayed++
+	}
+	n.lg.Info("state rebuilt from raft log",
+		zap.String("node_id", n.cfg.NodeID),
+		zap.Int("replayed_entries", replayed),
+		zap.Uint64("last_applied", n.lastApplied))
+	return nil
 }
 
 // checkCursors 挡的是 state 与 raft 日志对不上的那一格（不变式 4 的下半段）：

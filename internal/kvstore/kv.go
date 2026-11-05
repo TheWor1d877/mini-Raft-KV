@@ -51,9 +51,12 @@ func Open(cfg Config, lg *zap.Logger) (*KV, error) {
 	if err != nil {
 		return fail(err, nil)
 	}
-	rec, err := scanWAL(cfg, lg)
-	if err != nil {
-		return fail(err, lock)
+	var rec recovered
+	if !cfg.SkipWALRecovery {
+		rec, err = scanWAL(cfg, lg)
+		if err != nil {
+			return fail(err, lock)
+		}
 	}
 	w, err := newWAL(cfg, lg)
 	if err != nil {
@@ -68,6 +71,7 @@ func Open(cfg Config, lg *zap.Logger) (*KV, error) {
 		zap.String("data_dir", cfg.DataDir),
 		zap.Int("file_count", rec.fileCount),
 		zap.Int("recovered_entries", len(rec.entries)),
+		zap.Bool("skip_wal_recovery", cfg.SkipWALRecovery),
 		zap.Int64("duration_ms", durationMS(time.Since(start))))
 
 	return &KV{cfg: cfg, lg: WithComponent(lg, ComponentKV), lock: lock, wal: w, data: data}, nil
@@ -99,6 +103,13 @@ func (k *KV) Put(ctx context.Context, key, value string) error {
 		ValueField(value),
 		zap.String("value_fp", valueFingerprint(value)))
 	return nil
+}
+
+// Apply 只做状态机改动，不落任何日志：raft 日志的回放与补 apply 走这条路（docs/8 §二）。
+func (k *KV) Apply(key, value string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.data[key] = value
 }
 
 func (k *KV) Get(key string) (string, error) {

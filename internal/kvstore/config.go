@@ -38,6 +38,10 @@ type Config struct {
 	MaxFileSize int64
 	Fsync       bool
 	LogLevel    string
+
+	// SkipWALRecovery 是单日志合并的中间态开关：置真时 Open 不回放 KV WAL，
+	// map 交给 raft 日志的回放重建，KV WAL 照写不读。单机档改成单节点集群后整条取消。
+	SkipWALRecovery bool
 }
 
 func DefaultConfig() Config {
