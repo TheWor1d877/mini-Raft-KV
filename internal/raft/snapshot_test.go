@@ -66,6 +66,11 @@ func TestSnapshotFileByteLayout(t *testing.T) {
 	if payload[0] != OpSnapshotRecord {
 		t.Fatalf("record op = 0x%02x, want 0x%02x", payload[0], OpSnapshotRecord)
 	}
+	// op 的字面值在这里钉死：比对常量的那一句在常量被改时跟着改，
+	// 两个目录互读判坏那一格才拦得住 op 撞值（5.2 §6 的第三条变异）。
+	if payload[0] != 0x20 {
+		t.Fatalf("record op = 0x%02x, want the literal 0x20", payload[0])
+	}
 	if snap.Index != 7 || snap.Term != 3 || snap.Entries != 1 {
 		t.Fatalf("snapshot metadata = %+v, want index 7 term 3 entries 1", snap)
 	}

@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -65,6 +67,26 @@ var snapshotPointerFields = []string{"snapshotIndex", "snapshotTerm", "entries",
 
 // snapshotCRCTable 是 crc32c 的表：与 kvstore 的帧校验同一套算法。
 var snapshotCRCTable = crc32.MakeTable(crc32.Castagnoli)
+
+// 崩溃注入的停点（5.2 §5 缺口表里「真掉电造不出来」的那三格）：
+// MINIRAFT_SNAPSHOT_PAUSE_MS 给一个正数，快照与压缩的三处提交点各停那么久，
+// scripts/crash_inject.sh 才停得进「两步之间」——那三处窗口本来只有几毫秒，轮询追不上。
+// 三个停点是快照文件改名前、元数据指针改名前、日志段文件删除途中（compact.go 的两个删除循环）。
+// 不设它读到 0，进程行为与没有这段代码时一致；真掉电仍然造不出来，这里拉开的只是窗口。
+var crashPauseMS = func() int {
+	ms, err := strconv.Atoi(os.Getenv("MINIRAFT_SNAPSHOT_PAUSE_MS"))
+	if err != nil || ms < 0 {
+		return 0
+	}
+	return ms
+}()
+
+// crashPointPause 停在一次提交之前；只有注入开关打开时才睡。
+func crashPointPause() {
+	if crashPauseMS > 0 {
+		time.Sleep(time.Duration(crashPauseMS) * time.Millisecond)
+	}
+}
 
 // encodeSnapshotRecord 编出一条快照记录：op｜keylen｜key｜vallen｜value。
 func encodeSnapshotRecord(key, value string) ([]byte, error) {
@@ -206,6 +228,7 @@ func (s *snapshotter) writeFile(index uint64, data []byte) error {
 	if err := f.Close(); err != nil {
 		return kvstore.ErrIOFrom("close snapshot tmp", 0, err)
 	}
+	crashPointPause()
 	if err := os.Rename(tmp, s.cfg.SnapshotPath(index)); err != nil {
 		return kvstore.ErrIOFrom("rename snapshot file", 0, err)
 	}
@@ -249,6 +272,7 @@ func (s *snapshotter) storePointer(snap *Snapshot) error {
 		_ = os.Remove(tmp)
 		return kvstore.ErrIOFrom("close snapshot pointer tmp", 0, err)
 	}
+	crashPointPause()
 	if err := os.Rename(tmp, s.cfg.SnapshotPointerPath()); err != nil {
 		_ = os.Remove(tmp)
 		return kvstore.ErrIOFrom("rename snapshot pointer", 0, err)

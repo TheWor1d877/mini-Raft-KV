@@ -284,6 +284,8 @@ func (l *wal) dropPrefix(keepFrom uint64) error {
 			return kvstore.ErrIOFrom("remove wal segment", 0, err)
 		}
 		droppedSegments++
+		// 删日志途中的崩溃落点：每删掉一个段文件停一次，进程停在这里时磁盘上是「一部分段没了」。
+		crashPointPause()
 	}
 	if first.offset > 0 {
 		size, err := rewriteWALSegment(l.cfg, first.seq, first.offset)
@@ -335,6 +337,7 @@ func (l *wal) clearPrefix(keepFrom uint64) error {
 				return kvstore.ErrIOFrom("remove wal segment", 0, err)
 			}
 			droppedSegments++
+			crashPointPause()
 			continue
 		}
 		if s.seq == l.seq {
