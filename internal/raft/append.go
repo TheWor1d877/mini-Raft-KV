@@ -23,6 +23,11 @@ func (n *Node) appendOnce(peerID string) {
 		LeaderCommit: n.commitIndex,
 		Entries:      []LogEntry{},
 	}
+	// 在途确认轮存在时把本轮编号带上：为读发起的广播与例行心跳共用这一个函数，
+	// 区别只有这个字段是不是 0（4.1 §7）。
+	if n.activeRound != nil {
+		req.ReadRound = n.activeRound.round
+	}
 	if req.PrevLogIndex > 0 {
 		if e, ok := n.log.entryAt(req.PrevLogIndex); ok {
 			req.PrevLogTerm = e.term
@@ -51,21 +56,21 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 	// 1、2：旧 term 原样拒绝、不重置选举截止；更大的 term 先落 state 再生效（不变式 5）。
 	// state 落不了盘就不接受这个 term，按本地 term 拒绝。
 	if req.Term < n.term {
-		return AppendReply{Term: n.term}
+		return AppendReply{Term: n.term, ReadRound: req.ReadRound}
 	}
 	if req.Term > n.term {
 		if err := n.becomeFollower(req.Term, "leader contact"); err != nil {
-			return AppendReply{Term: n.term}
+			return AppendReply{Term: n.term, ReadRound: req.ReadRound}
 		}
 	} else if n.role == RoleCandidate {
 		// 同 term 里有别的节点在发 AppendEntries，说明它已经拿到多数派（3.1 §7）。
 		if err := n.becomeFollower(n.term, "candidate heard a same-term leader"); err != nil {
-			return AppendReply{Term: n.term}
+			return AppendReply{Term: n.term, ReadRound: req.ReadRound}
 		}
 	}
 	if n.role != RoleFollower {
 		// 本节点自认 Leader：同 term 的第二个 Leader 不许把它的日志掀掉，拒绝且不回退提示。
-		return AppendReply{Term: n.term, Success: false}
+		return AppendReply{Term: n.term, Success: false, ReadRound: req.ReadRound}
 	}
 
 	// 3：term 相等或刚被更新都算有效 Leader 联系，记下 leaderID 并重置选举截止。
@@ -77,7 +82,7 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 		prev, ok := n.log.entryAt(req.PrevLogIndex)
 		if !ok {
 			// 本地日志没这么长：conflictTerm 回 null，conflictIndex 取本地长度+1。
-			return n.rejectAppend(nil, n.log.lastIndex()+1)
+			return n.rejectAppend(nil, n.log.lastIndex()+1, req.ReadRound)
 		}
 		if prev.term != req.PrevLogTerm {
 			term := prev.term
@@ -85,7 +90,7 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 			if !ok {
 				index = prev.index
 			}
-			return n.rejectAppend(&term, index)
+			return n.rejectAppend(&term, index, req.ReadRound)
 		}
 	}
 
@@ -93,15 +98,15 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 	// 空数组的心跳不截：它只确认位置，删日志的是带条目的那一次（3.1 §7 第 5 步）。
 	if len(req.Entries) > 0 {
 		if err := n.log.truncateTo(req.PrevLogIndex); err != nil {
-			return AppendReply{Term: n.term, Success: false}
+			return AppendReply{Term: n.term, Success: false, ReadRound: req.ReadRound}
 		}
 		for _, e := range req.Entries {
 			if _, err := n.log.appendEntry(e.Term, e.Index, e.Command); err != nil {
-				return AppendReply{Term: n.term, Success: false}
+				return AppendReply{Term: n.term, Success: false, ReadRound: req.ReadRound}
 			}
 		}
 		if err := n.log.sync(); err != nil {
-			return AppendReply{Term: n.term, Success: false}
+			return AppendReply{Term: n.term, Success: false, ReadRound: req.ReadRound}
 		}
 	}
 
@@ -114,11 +119,12 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 	if err := n.applyCommitted(); err != nil {
 		n.logApplyFailure(err)
 	}
-	return AppendReply{Term: n.term, Success: true}
+	return AppendReply{Term: n.term, Success: true, ReadRound: req.ReadRound}
 }
 
-func (n *Node) rejectAppend(conflictTerm *uint64, conflictIndex uint64) AppendReply {
-	return AppendReply{Term: n.term, Success: false, ConflictTerm: conflictTerm, ConflictIndex: conflictIndex}
+func (n *Node) rejectAppend(conflictTerm *uint64, conflictIndex, readRound uint64) AppendReply {
+	return AppendReply{Term: n.term, Success: false, ConflictTerm: conflictTerm,
+		ConflictIndex: conflictIndex, ReadRound: readRound}
 }
 
 // handleAppendReply 处理一条回执（3.1 §7 的 Leader 一侧）。
@@ -133,6 +139,9 @@ func (n *Node) handleAppendReply(peerID string, req AppendRequest, reply AppendR
 	if reply.Term < n.term || req.Term != n.term || n.role != RoleLeader {
 		return
 	}
+
+	// 确认轮的计票与复制游标互不干扰：这一段只认轮次编号，不碰 matchIndex／nextIndex（4.1 §7）。
+	n.countReadRound(peerID, reply)
 
 	if reply.Success {
 		through := req.PrevLogIndex + uint64(len(req.Entries))

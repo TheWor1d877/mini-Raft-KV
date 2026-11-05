@@ -5,15 +5,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/TheWor1d877/mini-Raft-KV/internal/kvstore"
 )
 
 // tick 给指定的一批节点各打 rounds 轮 Tick；不传 ids 就是全集群。
-// 节点之间不共享时间，一轮就是每台机器各一次 Tick（D16）。
+// 一轮就是每台机器各一次 Tick（D16）；选举与心跳只看 tick 计数，
+// 租约走的是假时钟，假时钟每轮按 -tick-ms 前进一格（4.1 §7、D26）。
 func (c *cluster) tick(rounds int, ids ...string) {
 	wanted := map[string]bool{}
 	for _, id := range ids {
@@ -28,6 +33,7 @@ func (c *cluster) tick(rounds int, ids ...string) {
 				n.Tick()
 			}
 		}
+		c.clock.advance(time.Duration(c.raftCfg[c.ids[0]].TickMS) * time.Millisecond)
 	}
 }
 
@@ -117,8 +123,9 @@ func TestClusterElectsExactlyOneLeader(t *testing.T) {
 	}
 }
 
-// 写一条 key 之后 5 个节点的 /get 读到同一个值：leaderCommit 跟着心跳扩散，
-// 每个节点各自 apply（3.1 §7 第 6 步与「应用」段）。
+// 写一条 key 之后 5 个节点的本地档读都读到同一个值：leaderCommit 跟着心跳扩散，
+// 每个节点各自 apply（3.1 §7 第 6 步与「应用」段）。这一格查的是各节点各自的
+// apply 结果，与领导权无关，所以走 local 档（4.1 §4、D24）。
 func TestClusterReplicatesWriteToEveryNode(t *testing.T) {
 	c := newCluster(t, 5, zap.NewNop())
 	leaderID := c.waitForLeader(t, 60)
@@ -270,5 +277,119 @@ func TestClusterHealOverwritesStaleLeaderSuffix(t *testing.T) {
 			t.Errorf("Get(orphan) on %s = %v, want ErrKeyNotFound: the uncommitted write never applies",
 				id, err)
 		}
+	}
+}
+
+// 两种读法在 Leader 上读到同一个值：租约档与 ReadIndex 档都过领导权这一关，
+// 读索引都不小于写返回的 index（4.2 §3 的 cluster_test.go 行）。
+func TestClusterReadsTheSameValueInBothReadModes(t *testing.T) {
+	for _, mode := range []ReadMode{ReadModeLease, ReadModeReadIndex} {
+		t.Run(string(mode), func(t *testing.T) {
+			c := newClusterCfg(t, 5, zap.NewNop(), func(cfg *Config) {
+				cfg.ReadMode = mode
+			})
+			leaderID := c.waitForLeader(t, 60)
+			index, _, err := c.node(leaderID).Propose(context.Background(), "k", "v")
+			if err != nil {
+				t.Fatalf("propose on %s: %v", leaderID, err)
+			}
+
+			value, readIndex, _, err := c.node(leaderID).Read(context.Background(), "k", ConsistencyLinearizable)
+			if err != nil {
+				t.Fatalf("read on %s: %v", leaderID, err)
+			}
+			if value != "v" {
+				t.Errorf("value = %q, want v", value)
+			}
+			if readIndex < index {
+				t.Errorf("read index = %d, want at least the write's index %d", readIndex, index)
+			}
+		})
+	}
+}
+
+// 杀掉 Leader 之后新 Leader 的第一个线性读要走一轮确认才返回，轮次编号从 1 起。
+// 新节点没有租约，第一次读只能靠一轮确认拿到领导权（4.2 §3 的 cluster_test.go 行）。
+func TestClusterFirstReadOnTheNewLeaderGoesThroughARound(t *testing.T) {
+	core, logs := observer.New(zapcore.InfoLevel)
+	c := newClusterCfg(t, 5, zap.New(core), func(cfg *Config) {
+		cfg.ReadMode = ReadModeLease
+	})
+	oldID := c.waitForLeader(t, 60)
+	if _, _, err := c.node(oldID).Propose(context.Background(), "k", "v"); err != nil {
+		t.Fatalf("propose on %s: %v", oldID, err)
+	}
+	c.tick(4)
+
+	c.closeNode(oldID)
+	newID := c.waitForLeader(t, 60)
+	if newID == oldID {
+		t.Fatal("the killed node elected itself")
+	}
+
+	n := c.node(newID)
+	value, index, _, err := n.Read(context.Background(), "k", ConsistencyLinearizable)
+	if err != nil {
+		t.Fatalf("read on %s: %v", newID, err)
+	}
+	if value != "v" {
+		t.Errorf("value = %q, want v", value)
+	}
+	if index == 0 {
+		t.Errorf("read index = 0, want the settled index")
+	}
+	sent := logs.FilterMessage("read round sent").All()
+	if len(sent) != 1 {
+		t.Fatalf("read round sent entries = %d, want 1", len(sent))
+	}
+	if got := sent[0].ContextMap()["read_round"]; got != uint64(1) {
+		t.Errorf("read round = %v, want 1: the new leader has no lease to hit", got)
+	}
+}
+
+// 分区成 2/3：少数派那半即使有节点自认 Leader，线性读全部失败——确认轮凑不齐 3 票，
+// 读不返回任何值；本地档没有领导权确认，仍读得到旧值（不变式 6）。
+func TestClusterLinearReadsFailInTheMinorityPartition(t *testing.T) {
+	c := newClusterCfg(t, 5, zap.NewNop(), func(cfg *Config) {
+		cfg.ReadMode = ReadModeLease
+	})
+	leaderID := c.waitForLeader(t, 60)
+	if _, _, err := c.node(leaderID).Propose(context.Background(), "k", "v"); err != nil {
+		t.Fatalf("propose on %s: %v", leaderID, err)
+	}
+	c.tick(4)
+
+	minority, majority := splitAroundLeader(c.ids, leaderID)
+	c.partition(minority, majority)
+
+	n := c.node(leaderID)
+	if got := n.Role(); got != RoleLeader {
+		t.Fatalf("role of %s after the partition = %s, want it still believing it leads", leaderID, got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := n.Read(ctx, "k", ConsistencyLinearizable)
+		done <- err
+	}()
+	// 等这一轮确认在途：少数派的请求只到得了半个集群，回执凑不齐 3 票。
+	deadline := time.Now().Add(5 * time.Second)
+	for n.ReadRound() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the read never started a confirmation round")
+		}
+		runtime.Gosched()
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, ErrCanceled) {
+		t.Fatalf("linear read in the minority = %v, want ErrCanceled", err)
+	}
+
+	// 本地档读得到旧值：这一档没有领导权确认，也不参与线性一致的判定。
+	value, _, _, err := n.Read(context.Background(), "k", ConsistencyLocal)
+	if err != nil || value != "v" {
+		t.Errorf("local read in the minority = %q %v, want v", value, err)
 	}
 }

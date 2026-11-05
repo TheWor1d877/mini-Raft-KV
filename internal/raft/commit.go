@@ -90,6 +90,7 @@ func (n *Node) finishApply(through uint64) error {
 	if err := n.state.store(n.currentState()); err != nil {
 		return err
 	}
+	n.wakeApplyWaiters(through)
 	for index := previous + 1; index <= through; index++ {
 		if ch, ok := n.proposals[index]; ok {
 			ch <- nil
@@ -97,6 +98,21 @@ func (n *Node) finishApply(through uint64) error {
 		}
 	}
 	return nil
+}
+
+// wakeApplyWaiters 兑现 applyWaiters 里读索引不超过 through 的那些格（4.1 §8 不变式 1）。
+// 兑现点在 state 落盘之后：读被叫醒时状态机已经真的追上了这个 index。
+// 调用方必须持锁。
+func (n *Node) wakeApplyWaiters(through uint64) {
+	for index, waiters := range n.applyWaiters {
+		if index > through {
+			continue
+		}
+		for _, ch := range waiters {
+			ch <- struct{}{}
+		}
+		delete(n.applyWaiters, index)
+	}
 }
 
 // logApplyFailure 打的是已提交条目进不了状态机这条链：复制已经兑现，

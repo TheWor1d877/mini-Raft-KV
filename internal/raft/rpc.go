@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -185,6 +186,11 @@ type getResponse struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 	ReqID string `json:"req_id"`
+	// ReadIndex 与 Term 是线性一致读的两个游标；local 档的读索引回 0、任期回本地任期（4.1 §4、D24）。
+	ReadIndex uint64 `json:"read_index"`
+	Term      uint64 `json:"term"`
+	// Stale 只在 local 档为真：这一读没有领导权确认（D24、不变式 6）。
+	Stale bool `json:"stale"`
 }
 
 // errorResponse 的形状沿用 2.1 §4：error 给人看，code 给机器判，offset 指向坏记录的字节位置。
@@ -208,9 +214,11 @@ type notLeaderResponse struct {
 
 // 三条 POST 路径各自的必填字段：缺一个就是 400，不能让一个字段都不带的请求
 // 静默退化成「term 0 的心跳」——RPC 的每个字段都参与状态机判定（3.1 §4）。
+// append-entries 的 readRound 也在必填之列：补零之后，为读发起的确认轮与例行心跳
+// 在请求上就分不出来了（4.1 §4、D25）。
 var (
 	voteFields   = []string{"term", "candidateId", "lastLogIndex", "lastLogTerm"}
-	appendFields = []string{"term", "leaderId", "prevLogIndex", "prevLogTerm", "entries", "leaderCommit"}
+	appendFields = []string{"term", "leaderId", "prevLogIndex", "prevLogTerm", "entries", "leaderCommit", "readRound"}
 	putFields    = []string{"key", "value"}
 )
 
@@ -225,7 +233,7 @@ func (h *nodeHandler) handlePut(w http.ResponseWriter, r *http.Request, reqID st
 	index, term, err := h.n.Propose(ctx, body.Key, body.Value)
 	if err != nil {
 		if errors.Is(err, ErrNotLeader) {
-			h.notLeader(w, reqID, err, start)
+			h.notLeader(w, routePut, reqID, err, start)
 			return
 		}
 		if errors.Is(err, kvstore.ErrIO) && h.n.writeDisabled() && h.quitting.CompareAndSwap(false, true) {
@@ -247,12 +255,28 @@ func (h *nodeHandler) handleGet(w http.ResponseWriter, r *http.Request, reqID st
 			"bad_request", "query parameter key is required", 0, start)
 		return
 	}
-	value, err := h.n.Get(r.URL.Query().Get("key"))
+	mode, err := parseConsistency(r.URL.Query().Get("consistency"))
 	if err != nil {
+		h.fail(w, routeGet, reqID, http.StatusBadRequest, "bad_request", err.Error(), 0, start)
+		return
+	}
+	key := r.URL.Query().Get("key")
+	// 单次读的上界由 -read-timeout-ms 给，Node 内部不起计时器（D28）。
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(h.n.cfg.ReadTimeoutMS)*time.Millisecond)
+	defer cancel()
+	value, index, term, err := h.n.Read(ctx, key, mode)
+	if err != nil {
+		if errors.Is(err, ErrNotLeader) {
+			h.notLeader(w, routeGet, reqID, err, start)
+			return
+		}
 		h.failWithError(w, routeGet, reqID, err, start)
 		return
 	}
-	h.ok(w, routeGet, reqID, getResponse{Key: r.URL.Query().Get("key"), Value: value, ReqID: reqID}, start)
+	h.ok(w, routeGet, reqID, getResponse{
+		Key: key, Value: value, ReqID: reqID,
+		ReadIndex: index, Term: term, Stale: mode == ConsistencyLocal,
+	}, start)
 }
 
 // decodeOne 收一条请求体：超限、非法 JSON、缺字段、把多条写塞进一个请求都在这一步挡住（2.1 §4 同口径）。
@@ -285,16 +309,17 @@ func (h *nodeHandler) badBody(w http.ResponseWriter, route, reqID string, err er
 		"bad_request", "body must be one JSON object: "+err.Error(), 0, start)
 }
 
-// notLeader 是 /put 在非 Leader 上的那一格：503 带 leader 提示，客户端按提示改投（3.1 §4）。
+// notLeader 是客户端那两条路径在非 Leader 上的那一格：503 带 leader 提示，
+// 客户端按提示改投（3.1 §4、4.1 §4）。
 // 这个节点没听说过 Leader 时两个字段留空，形状不变。
-func (h *nodeHandler) notLeader(w http.ResponseWriter, reqID string, err error, start time.Time) {
+func (h *nodeHandler) notLeader(w http.ResponseWriter, route, reqID string, err error, start time.Time) {
 	id, addr, ok := h.n.Leader()
 	if !ok {
 		id, addr = "", ""
 	}
 	h.lg.Warn("http request failed",
 		zap.String("req_id", reqID),
-		zap.String("route", routePut),
+		zap.String("route", route),
 		zap.Int("status", http.StatusServiceUnavailable),
 		zap.String("code", "not_leader"),
 		zap.String("leader_id", id),

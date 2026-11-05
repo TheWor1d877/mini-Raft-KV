@@ -32,10 +32,13 @@ func (r Role) String() string {
 	}
 }
 
-// Stats 是测试与注入脚本的读数窗口，字段口径见 3.1 §4。
+// Stats 是测试与注入脚本的读数窗口，字段口径见 3.1 §4；
+// 租约剩余与确认轮次两项归 doc 4（4.1 §4）。
 type Stats struct {
 	Term, CommitIndex, LastApplied, LastLogIndex, Votes uint64
 	Role                                                Role
+	LeaseRemainingMS                                    int64
+	ReadRound                                           uint64
 }
 
 // 两个 RPC 的请求与响应。字段名与 doc 3 的 JSON 一一对应，映射写在 rpc.go（M12）。
@@ -64,6 +67,9 @@ type AppendRequest struct {
 	PrevLogTerm  uint64     `json:"prevLogTerm"`
 	Entries      []LogEntry `json:"entries"`
 	LeaderCommit uint64     `json:"leaderCommit"`
+	// ReadRound 是这一轮确认的编号，0 表示这一条不为任何读做确认（4.1 §4、D25）。
+	// Follower 不解释它，只把请求里带来的编号原样回显。
+	ReadRound uint64 `json:"readRound"`
 }
 
 // ConflictTerm 是指针：Follower 日志太短那一格要回 "conflictTerm": null（3.1 §4）。
@@ -72,6 +78,8 @@ type AppendReply struct {
 	Success       bool    `json:"success"`
 	ConflictTerm  *uint64 `json:"conflictTerm"`
 	ConflictIndex uint64  `json:"conflictIndex"`
+	// ReadRound 原样带回发起时的编号（4.1 §4、D25）。
+	ReadRound uint64 `json:"readRound"`
 }
 
 // Transport 是节点间的发送通道。httpTransport（M12）与测试的内存实现调的是同一对处理函数。
@@ -89,7 +97,7 @@ type rpcTask struct {
 }
 
 // Node 是一个 raft 节点，一个进程一个（D17）。
-// 一把互斥锁护住四个标量、日志视图、投票计数与在途提案表（3.1 §4）。
+// 一把互斥锁护住四个标量、日志视图、投票计数、在途提案表与读路径的三张表（3.1 §4、4.1 §9）。
 type Node struct {
 	cfg Config
 	kv  *kvstore.KV
@@ -120,6 +128,21 @@ type Node struct {
 
 	// proposals 是 index→完成通知；登记与兑现都是包内未导出函数（T22.4）。
 	proposals map[uint64]chan error
+
+	// 读路径的状态：租约绑定任期与截止时刻，在途确认轮至多一个，
+	// 读队列与 apply 等待表挂在这把锁上。全部只活在内存里，一个字节都不落盘（4.1 §5、基线共同不变量 4）。
+	leaseTerm    uint64
+	leaseUntilNS int64
+	leaseWindow  int64
+	readRoundSeq uint64
+	readArrivals uint64
+	readQueue    readQueue
+	activeRound  *activeRound
+	applyWaiters applyWaiters
+
+	// now 是租约唯一的取时入口：真实实现是单调纳秒，测试夹具换成一根可被用例拨动的计数器。
+	// 除 read.go 之外一律不许读表，选举与心跳只看 tick 计数（D16、D26）。
+	now func() int64
 
 	outbox  []rpcTask
 	started bool
@@ -164,6 +187,9 @@ func NewNode(cfg Config, kv *kvstore.KV, tp Transport, lg *zap.Logger) (*Node, e
 		electionTicks:  ticks(cfg.ElectionTimeoutMS, cfg.TickMS),
 		heartbeatTicks: ticks(cfg.HeartbeatMS, cfg.TickMS),
 		proposals:      map[uint64]chan error{},
+		applyWaiters:   applyWaiters{},
+		now:            monotonicNow,
+		leaseWindow:    leaseWindow(cfg),
 	}
 	n.electionDeadline = n.rollElectionDeadline()
 	// 启动序列的最后一步：把已提交但没进状态机的条目补 apply（3.1 §7）。
@@ -258,6 +284,8 @@ func (n *Node) tickLocked() {
 		}
 		n.heartbeatElapsed = 0
 		n.broadcastAppends()
+		// Leader 分支是确认轮的第三个触发点：队列里有读而没有在途轮次就补发一轮（4.1 §7）。
+		n.scheduleReadRound()
 		return
 	}
 	n.electionDeadline--
@@ -338,6 +366,12 @@ func (n *Node) transition(role Role, term uint64, votedFor, reason string) error
 			zap.String("old_role", n.role.String()),
 			zap.String("new_role", role.String()),
 			zap.Uint64("term", term))
+	}
+	// 任期或角色一变，租约与在途轮次当场作废，没返回的读跟着走（4.1 §7 租约失效）。
+	if term != n.term {
+		n.invalidateLease("higher_term", ErrNotLeader)
+	} else if role != RoleLeader {
+		n.invalidateLease("stepped_down", ErrNotLeader)
 	}
 	n.role, n.term, n.votedFor = role, term, votedFor
 	return nil
@@ -434,17 +468,23 @@ func (n *Node) writeDisabled() bool {
 	return n.log.disabled()
 }
 
-// Stats 是六个读数的一次快照（3.1 §4）。
+// Stats 是八个读数的一次快照（3.1 §4、4.1 §4）。
 func (n *Node) Stats() Stats {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	var round uint64
+	if n.activeRound != nil {
+		round = n.activeRound.round
+	}
 	return Stats{
-		Term:         n.term,
-		CommitIndex:  n.commitIndex,
-		LastApplied:  n.lastApplied,
-		LastLogIndex: n.log.lastIndex(),
-		Votes:        uint64(n.votes),
-		Role:         n.role,
+		Term:             n.term,
+		CommitIndex:      n.commitIndex,
+		LastApplied:      n.lastApplied,
+		LastLogIndex:     n.log.lastIndex(),
+		Votes:            uint64(n.votes),
+		Role:             n.role,
+		LeaseRemainingMS: n.leaseRemainingLocked(),
+		ReadRound:        round,
 	}
 }
 
@@ -503,7 +543,8 @@ func (n *Node) Propose(ctx context.Context, key, value string) (uint64, uint64, 
 	}
 }
 
-// Get 是本地读，可能读到旧值；线性一致读归 doc 4（3.1 §9）。
+// Get 是本地档读：不确认领导权，可能读到旧值，等价于 `/get?consistency=local`。
+// 客户端读路径走 Read（4.1 §4），默认档是线性一致读。
 func (n *Node) Get(key string) (string, error) { return n.kv.Get(key) }
 
 func (n *Node) currentState() State {
@@ -552,6 +593,7 @@ func (n *Node) Close() error {
 	n.closed = true
 	n.outbox = nil
 	n.cancelProposals(ErrCanceled)
+	n.invalidateLease("closed", ErrCanceled)
 
 	err := n.kv.Flush()
 	if storeErr := n.state.store(n.currentState()); storeErr != nil {

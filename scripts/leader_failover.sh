@@ -80,8 +80,9 @@ leader_now() {
 wait_ready() {
 	local addr="$1" dir="$2" code
 	for _ in $(seq 1 400); do
-		code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://$addr/get?key=__probe__" || true)"
-		# 404 与 200 都是 handler 起来了；503 只会来自 /put，探活走的是 /get。
+		code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://$addr/get?key=__probe__&consistency=local" || true)"
+		# 探活走 local 档：404 与 200 都是 handler 起来了。默认档在无 Leader 期间回 503，
+		# 那一档要的是领导权确认，探活不该被它挡住（4.1 §4、D24）。
 		[[ "$code" == "404" || "$code" == "200" ]] && return 0
 		sleep 0.05
 	done
@@ -165,11 +166,13 @@ for ((round = 1; round <= ROUNDS; round++)); do
 	elected_in_ms=$(((elected_ns - t0) / 1000000))
 
 	# 重选主后新 Leader 上逐条 /get：读得回的条数（在途那批里最终落盘的）。
+	# 这一格查的是「那条写有没有落进状态机」，走 local 档：默认档要领导权确认，
+	# 读的是值而不是领导权（4.1 §4、D24）。
 	sleep 1
 	landed=0
 	for key in "${keys[@]}"; do
 		code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-			"http://${ADDR_OF[$elected_id]}/get?key=${key}" || true)"
+			"http://${ADDR_OF[$elected_id]}/get?key=${key}&consistency=local" || true)"
 		[[ "$code" == "200" ]] && landed=$((landed + 1))
 	done
 

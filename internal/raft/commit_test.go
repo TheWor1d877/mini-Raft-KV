@@ -3,7 +3,9 @@ package raft
 import (
 	"context"
 	"errors"
+	"runtime"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -217,5 +219,109 @@ func TestRecoveredStateMatchesAppliedEntries(t *testing.T) {
 	}
 	if got := restarted.Stats(); got.LastApplied != stats.LastApplied {
 		t.Errorf("lastApplied = %d, want it back at %d", got.LastApplied, stats.LastApplied)
+	}
+}
+
+// waitApplyWaiter 等到有读挂进 applyWaiters：它停在那里等 apply 兑现（4.1 §7 等待应用）。
+func waitApplyWaiter(t *testing.T, n *Node) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		n.mu.Lock()
+		parked := len(n.applyWaiters)
+		n.mu.Unlock()
+		if parked > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the read never parked on an apply waiter")
+		}
+		runtime.Gosched()
+	}
+}
+
+// Flush 失败的那一批里 lastApplied 不动，落在该批上的线性读不返回成功：
+// 它挂在 applyWaiters 上等 apply 兑现，等到超时才走，日志里留下三个游标（4.1 §8 第一条、D27、4.2 §3 的 commit 行）。
+func TestLinearReadWaitsOnTheApplyThatFailedToFlush(t *testing.T) {
+	c, n, logs := leaderFixture(t)
+	putOne(t, n, "k", "v")
+	before := n.Stats()
+
+	c.breakKV("node-1")
+	command, err := kvstore.EncodeEntry("k2", "v2")
+	if err != nil {
+		t.Fatalf("encode the command: %v", err)
+	}
+	n.mu.Lock()
+	mustAppend(t, n.log, n.term, before.LastLogIndex+1, string(command))
+	n.matchIndex["node-2"] = before.LastLogIndex + 1
+	n.matchIndex["node-3"] = before.LastLogIndex + 1
+	n.advanceCommit()
+	applyErr := n.applyCommitted()
+	stats := Stats{CommitIndex: n.commitIndex, LastApplied: n.lastApplied}
+	n.mu.Unlock()
+
+	if !errors.Is(applyErr, kvstore.ErrIO) {
+		t.Fatalf("applyCommitted = %v, want ErrIO from the failed flush", applyErr)
+	}
+	if stats.LastApplied != before.LastApplied {
+		t.Fatalf("lastApplied = %d, want it kept at %d", stats.LastApplied, before.LastApplied)
+	}
+
+	// 这条读落在失败的那一批上：读索引是 commitIndex，lastApplied 还停在上一批的边界上。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := n.Read(ctx, "k2", ConsistencyLinearizable)
+		done <- err
+	}()
+	waitApplyWaiter(t, n)
+	cancel()
+
+	if err := <-done; !errors.Is(err, ErrCanceled) {
+		t.Fatalf("read = %v, want ErrCanceled: the apply it waits for never comes", err)
+	}
+	// 超时之后那一格从 applyWaiters 里摘掉，不留下唤醒不了的等待（D28）。
+	n.mu.Lock()
+	waiters := len(n.applyWaiters)
+	n.mu.Unlock()
+	if waiters != 0 {
+		t.Errorf("apply waiters = %d, want 0 after the timeout", waiters)
+	}
+	entry := logs.FilterMessage("read wait timed out").All()
+	if len(entry) != 1 {
+		t.Fatalf("read wait timed out entries = %d, want 1", len(entry))
+	}
+	fields := entry[0].ContextMap()
+	if fields["read_index"] != uint64(stats.CommitIndex) {
+		t.Errorf("read_index = %v, want %d", fields["read_index"], stats.CommitIndex)
+	}
+	if fields["last_applied"] != uint64(before.LastApplied) {
+		t.Errorf("last_applied = %v, want %d", fields["last_applied"], before.LastApplied)
+	}
+	if fields["commit_index"] != uint64(stats.CommitIndex) {
+		t.Errorf("commit_index = %v, want %d", fields["commit_index"], stats.CommitIndex)
+	}
+
+	// 恢复补 apply 之后，同一个读请求立刻成功：值是补 apply 之后才进状态机的那一条。
+	recovered := c.recover("node-1")
+	if got := recovered.Stats(); got.LastApplied != got.CommitIndex {
+		t.Fatalf("stats after the recovery = %+v, want both cursors together", got)
+	}
+	c.injectVotes("node-1", grant(4), grant(4), deny(4), deny(4))
+	runElection(t, recovered)
+	if got := recovered.Role(); got != RoleLeader {
+		t.Fatalf("role after the second election = %s, want leader", got)
+	}
+	value, index, _, err := recovered.Read(context.Background(), "k2", ConsistencyLinearizable)
+	if err != nil {
+		t.Fatalf("read after the recovery: %v", err)
+	}
+	if value != "v2" {
+		t.Errorf("value = %q, want v2", value)
+	}
+	if index < recovered.Stats().LastApplied {
+		t.Errorf("read index = %d, want it at least at the applied cursor %d", index, recovered.Stats().LastApplied)
 	}
 }

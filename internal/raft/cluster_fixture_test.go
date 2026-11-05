@@ -1,10 +1,12 @@
 package raft
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -27,6 +29,22 @@ type sentRPC struct {
 	vote VoteRequest
 	app  AppendRequest
 }
+
+// appendReplySpec 是一条预置的 AppendEntries 回执。
+// followRound 为真时，回执的 readRound 取请求里带的编号：确认轮的编号用例不必先知道，
+// 就能按轮次计票（4.1 §7、4.2 §3 的夹具行）。
+type appendReplySpec struct {
+	reply       AppendReply
+	followRound bool
+}
+
+// fakeClock 是读路径的假时钟：Node.now 只从这里取（4.1 §7、D26）。
+// 用例拨它，串行 RPC 的耗时也落在这根线上。
+type fakeClock struct{ ns int64 }
+
+func (c *fakeClock) now() int64 { return c.ns }
+
+func (c *fakeClock) advance(d time.Duration) { c.ns += int64(d) }
 
 // stubTransport 是一个节点的发送通道：调用记进集群，先看注入的回执，
 // 再看分区开关，都没有就落到对端节点的同一对处理函数上（3.1 §4）。
@@ -53,9 +71,15 @@ func (s *stubTransport) RequestVote(to string, req VoteRequest) (VoteReply, erro
 
 func (s *stubTransport) AppendEntries(to string, req AppendRequest) (AppendReply, error) {
 	s.c.sent = append(s.c.sent, sentRPC{from: s.id, to: s.c.idOf(to), kind: "append", app: req})
-	if replies := s.c.appendQueue[s.id]; len(replies) > 0 {
-		s.c.appendQueue[s.id] = replies[1:]
-		return replies[0], nil
+	s.c.advanceClock(s.id)
+	if specs := s.c.appendQueue[s.id]; len(specs) > 0 {
+		spec := specs[0]
+		s.c.appendQueue[s.id] = specs[1:]
+		reply := spec.reply
+		if spec.followRound {
+			reply.ReadRound = req.ReadRound
+		}
+		return reply, nil
 	}
 	if s.c.blocked[s.id][to] {
 		return AppendReply{}, errFixtureDown
@@ -82,12 +106,18 @@ type cluster struct {
 	sent      []sentRPC
 	voteQueue map[string][]VoteReply
 	// appendQueue 与 blocked 从 M11 起用得上，夹具一次建齐（T21.5）。
-	appendQueue map[string][]AppendReply
+	appendQueue map[string][]appendReplySpec
 	blocked     map[string]map[string]bool
 	// broken 记的是被 breakKV 关过 KV 的节点：这些节点收尾时的 ErrIO 是夹具自己造的失效。
 	broken map[string]bool
 	addrID map[string]string
 	closed bool
+
+	// clock 是读路径的假时钟：节点们共用一根计数器，用例拨它，
+	// 或者让每条为在途确认轮发出的 AppendEntries 前进 clockStep（4.1 §7）。
+	clock *fakeClock
+	// clockStep 是每条在途确认轮的请求推进的时长；0 表示时钟只由用例拨。
+	clockStep time.Duration
 }
 
 func newCluster(t *testing.T, size int, lg *zap.Logger) *cluster {
@@ -107,10 +137,11 @@ func newClusterCfg(t *testing.T, size int, lg *zap.Logger, mut func(*Config)) *c
 		kvCfg:   map[string]kvstore.Config{},
 
 		voteQueue:   map[string][]VoteReply{},
-		appendQueue: map[string][]AppendReply{},
+		appendQueue: map[string][]appendReplySpec{},
 		blocked:     map[string]map[string]bool{},
 		broken:      map[string]bool{},
 		addrID:      map[string]string{},
+		clock:       &fakeClock{},
 	}
 	peers := map[string]string{}
 	for i := 1; i <= size; i++ {
@@ -155,6 +186,8 @@ func (c *cluster) start(id string) {
 	if err != nil {
 		t.Fatalf("new node %s: %v", id, err)
 	}
+	// 租约的取时只经 Node.now，夹具把这一处换成假时钟（4.1 §7、D26）。
+	node.now = c.clock.now
 	c.nodes[id] = node
 }
 
@@ -254,7 +287,35 @@ func (c *cluster) injectVotes(from string, replies ...VoteReply) {
 // injectAppends 同上，注入的是 AppendEntries 的回执。
 // 选举类用例把心跳回执也注入，回执才不会被对端节点的真实处理污染观察者日志。
 func (c *cluster) injectAppends(from string, replies ...AppendReply) {
-	c.appendQueue[from] = append(c.appendQueue[from], replies...)
+	for _, reply := range replies {
+		c.appendQueue[from] = append(c.appendQueue[from], appendReplySpec{reply: reply})
+	}
+}
+
+// injectAppendRounds 注入的回执跟着请求里的确认轮编号走：回执的 readRound 取请求的值，
+// 用例不用先知道轮次编号就能计票（4.1 §7）。
+func (c *cluster) injectAppendRounds(from string, replies ...AppendReply) {
+	for _, reply := range replies {
+		c.appendQueue[from] = append(c.appendQueue[from], appendReplySpec{reply: reply, followRound: true})
+	}
+}
+
+// advanceClock 在确认轮在途时把假时钟拨一格：串行 RPC 的耗时落在这根线上，
+// 租约窗口就是被它算掉的（4.1 §7）。轮次不在途时不拨，时钟只由用例拨。
+func (c *cluster) advanceClock(from string) {
+	if c.clockStep <= 0 {
+		return
+	}
+	n := c.nodes[from]
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	inFlight := n.activeRound != nil
+	n.mu.Unlock()
+	if inFlight {
+		c.clock.advance(c.clockStep)
+	}
 }
 
 // seedEntry 是 reseed 要预先落到盘上的一条 raft 日志条目。
@@ -353,6 +414,32 @@ func (c *cluster) sentTo(from string) []string {
 		out = append(out, s.to)
 	}
 	return out
+}
+
+// 租约的取时只走注入位：墙上时间不进状态机判定（D26、4.1 §3 的禁止项）。
+// 这条用一次源码扫描实现：四个文件里出现 time.Now() 或 time.Since 就是命中，
+// 注入位 n.now() 也只许 read.go 调。
+func TestClockInjectionKeepsWallTimeOutOfTheStateMachine(t *testing.T) {
+	for _, name := range []string{"node.go", "append.go", "commit.go", "vote.go"} {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		for _, banned := range []string{"time.Now()", "time.Since"} {
+			if bytes.Contains(data, []byte(banned)) {
+				t.Errorf("%s contains %q: the wall clock must not reach the state machine", name, banned)
+			}
+		}
+	}
+	for _, name := range []string{"node.go", "append.go", "commit.go", "vote.go", "rpc.go", "state.go"} {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if bytes.Contains(data, []byte("n.now(")) {
+			t.Errorf("%s calls the injected clock: only read.go may", name)
+		}
+	}
 }
 
 // 夹具自己的那条断言：raft/ 的独占由 kvstore.Open 的 LOCK 覆盖，raft 不取第二把锁（3.1 §4 NewNode 行）。

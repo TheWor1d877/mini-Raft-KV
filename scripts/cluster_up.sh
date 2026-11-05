@@ -44,8 +44,9 @@ mkdir -p "$ROOT_DATA"
 wait_ready() {
 	local addr="$1" dir="$2" code
 	for _ in $(seq 1 400); do
-		code="$(curl -s -o /dev/null -w '%{http_code}' "http://$addr/get?key=__probe__" || true)"
-		# 404 与 200 都是 handler 起来了；503 只会来自 /put，探活走的是 /get。
+		code="$(curl -s -o /dev/null -w '%{http_code}' "http://$addr/get?key=__probe__&consistency=local" || true)"
+		# 探活走 local 档：404 与 200 都是 handler 起来了。默认档在无 Leader 期间回 503，
+		# 那一档要的是领导权确认，探活不该被它挡住（4.1 §4、D24）。
 		[[ "$code" == "404" || "$code" == "200" ]] && return 0
 		sleep 0.05
 	done

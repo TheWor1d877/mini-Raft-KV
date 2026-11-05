@@ -401,3 +401,49 @@ func TestConfigLoadFlags(t *testing.T) {
 		}
 	})
 }
+
+// 读路径三个开关与三条新增校验（4.1 §6、4.2 §3 的 state_test.go 行）：
+// 取值非法、负漂移、非正读超时各自报错；租约档的窗口要长过一轮广播，
+// 确认档的读超时也要长过一轮广播。
+func TestConfigLoadReadSwitches(t *testing.T) {
+	five := "node-1=127.0.0.1:8801,node-2=127.0.0.1:8802,node-3=127.0.0.1:8803," +
+		"node-4=127.0.0.1:8804,node-5=127.0.0.1:8805"
+
+	t.Run("defaults land on the config", func(t *testing.T) {
+		cfg, _, err := Load([]string{"-node-id", "node-1", "-peers", five})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.ReadMode != ReadModeLease || cfg.ClockDriftMS != 50 || cfg.ReadTimeoutMS != 1000 {
+			t.Errorf("read switches = %s/%d/%d, want lease/50/1000",
+				cfg.ReadMode, cfg.ClockDriftMS, cfg.ReadTimeoutMS)
+		}
+	})
+
+	for name, args := range map[string][]string{
+		"read mode outside the two values": {"-node-id", "node-1", "-peers", five, "-read-mode", "bogus"},
+		"read mode empty":                  {"-node-id", "node-1", "-peers", five, "-read-mode", ""},
+		"negative clock drift":             {"-node-id", "node-1", "-peers", five, "-clock-drift-ms", "-1"},
+		"zero read timeout":                {"-node-id", "node-1", "-peers", five, "-read-timeout-ms", "0"},
+		"negative read timeout":            {"-node-id", "node-1", "-peers", five, "-read-timeout-ms", "-5"},
+		// 5 节点、RPC 超时 100ms：一轮广播最坏 400ms；T=400 时租约窗口只剩 350ms，不够。
+		"lease window shorter than a broadcast": {"-node-id", "node-1", "-peers", five,
+			"-election-timeout-ms", "400", "-read-mode", "lease"},
+		"read timeout shorter than a broadcast": {"-node-id", "node-1", "-peers", five,
+			"-read-mode", "readindex", "-read-timeout-ms", "300"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := Load(args); err == nil {
+				t.Fatalf("Load(%q) accepted the bad command line", strings.Join(args, " "))
+			}
+		})
+	}
+
+	// 同一份配置在确认档通过：租约窗口那条只约束 lease 档。
+	t.Run("the same clocks pass in the readindex mode", func(t *testing.T) {
+		if _, _, err := Load([]string{"-node-id", "node-1", "-peers", five,
+			"-election-timeout-ms", "400", "-read-mode", "readindex"}); err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+	})
+}

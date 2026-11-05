@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -107,6 +108,8 @@ func (p *processCluster) url(id, path string) string {
 }
 
 // waitReady 只认 handler 的答复：404 与 200 都是 /get 起来了，连不上与 5xx 都算没就绪。
+// 探活走本地档：这一档在任意节点都回 200 或 404，503 只可能来自缺省档（那时这台不是 Leader，
+// 不能当成没就绪）（4.1 §4、D24）。
 func (p *processCluster) waitReady(id string) {
 	p.t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -120,7 +123,22 @@ func (p *processCluster) waitReady(id string) {
 	p.t.Fatalf("node %s never answered /get on %s: %s", id, p.addr[id], p.logTail(id, 8))
 }
 
+// get 走显式的本地旧数据档：任意节点都回 200（key 不存在是 404），读到的可能是旧值。
+// D24 之后 raft 侧所有只是想读回一个值的调用点都要显式带 consistency=local，
+// 缺省档是线性一致读，在 Follower 上只会拿到 503 not_leader。
 func (p *processCluster) get(id, key string) (int, []byte, error) {
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Get(p.url(id, "/get?key="+key+"&consistency=local"))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, raw, err
+}
+
+// getLinear 走缺省的线性一致档：只有 Leader 服务，其余节点回 503 not_leader，
+// 等不到状态机应用或等待超时是 500 canceled（4.1 §4、D24）。
+func (p *processCluster) getLinear(id, key string) (int, []byte, error) {
 	resp, err := (&http.Client{Timeout: 2 * time.Second}).Get(p.url(id, "/get?key="+key))
 	if err != nil {
 		return 0, nil, err
@@ -347,6 +365,291 @@ func TestKillLeaderReElectsAndKeepsTheValue(t *testing.T) {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
+}
+
+// 重选主窗口里的读结果：kill -9 之前起 20 条在途写，窗口内对旧 Leader 与各节点持续发缺省档的
+// /get，逐条记录状态码、值与读索引（4.2 的 cluster_process_test.go 行、T30.4）。
+// 判据有四条：结果只有 200、503 not_leader、500 canceled 三种；
+// 出现 200 时读索引不小于那条写的日志 index，读到的值就是读索引之前最后一条写的值；
+// 窗口里一次都不出现「200 且值旧于最后一条已确认写」；
+// 本地档在在途写还没提交时读到的是 kill 前那条已确认写的旧值。
+func TestReelectionWindowLinearReadResults(t *testing.T) {
+	if testing.Short() {
+		t.Skip("进程用例要起 5 个真进程并等重选主窗口，-short 下跳过")
+	}
+	p := newProcessCluster(t, 5)
+
+	const key = "window"
+	const confirmedValue = "confirmed-v0"
+	leader, acked := p.writeThrough(key, confirmedValue)
+	confirmedIndex := toFloat(acked["index"])
+	if confirmedIndex <= 0 {
+		t.Fatalf("the acked write reported index %v, want a positive one", acked["index"])
+	}
+
+	// 20 条在途写：并发打向现任 Leader，值各不相同。
+	// 值里垫一段填充是为了把每条的 fsync 拉长，kill 才落在写与写之间：
+	// 被杀的那台来不及把新的 commitIndex 告诉跟随者，它们就还停在 kill 前那条已确认写的值上。
+	padding := strings.Repeat("x", 256*1024)
+	values := make([]string, 20)
+	for i := range values {
+		values[i] = fmt.Sprintf("inflight-%02d", i) + padding
+	}
+	inflightTags := map[string]bool{}
+	for _, value := range values {
+		inflightTags[valueTag(value)] = true
+	}
+
+	type putOutcome struct {
+		value  string
+		status int
+		index  float64
+		err    error
+	}
+	outcomes := make(chan putOutcome, len(values))
+	for _, value := range values {
+		go func(value string) {
+			status, body, err := p.put(leader, key, value)
+			out := putOutcome{value: value, status: status, err: err}
+			if err == nil && status == http.StatusOK {
+				out.index = toFloat(body["index"])
+			}
+			outcomes <- out
+		}(value)
+	}
+
+	// 在途写刚发出去、还没提交的那一刻，本地档读到的就是 kill 前那条已确认写的值：
+	// 这一格是「读到旧值」的装置证据（4.2 的 cluster_process_test.go 行）。
+	// 旧 Leader 这时已经应用了那条已确认写，而在途写要等多数派回执才提交。
+	inFlightLocal := ""
+	{
+		status, raw, err := p.get(leader, key)
+		if err == nil && status == http.StatusOK {
+			var body map[string]any
+			if json.Unmarshal(raw, &body) == nil {
+				value, _ := body["value"].(string)
+				inFlightLocal = valueTag(value)
+			}
+		}
+	}
+
+	// 等第一条在途写被确认：被确认的那条才是新 Leader 会提交的那条，
+	// 窗口里的 200 才可能读到在途写的值而不是 kill 前那条已确认写的值。
+	// 通道上阻塞着等，确认一回来就动手，不给 kill 留出额外的延迟。
+	ackedIndex := map[string]float64{}
+	firstAcked := false
+	ackDeadline := time.Now().Add(10 * time.Second)
+	for !firstAcked {
+		select {
+		case out := <-outcomes:
+			if out.err == nil && out.status == http.StatusOK {
+				ackedIndex[valueTag(out.value)] = out.index
+				firstAcked = true
+			}
+		case <-time.After(time.Until(ackDeadline)):
+			t.Fatalf("no in-flight write was acked within 10s")
+		}
+	}
+
+	p.kill9(leader)
+
+	// 窗口：旧 Leader 的地址连不上，其余节点在选出新 Leader 之前回 503，
+	// 之后回 200 或者 500。逐条记下来，判据只认这三类。
+	type linearSample struct {
+		node      string
+		tag       string
+		readIndex float64
+	}
+	var linear []linearSample
+	statusCounts := map[int]int{}
+	codeCounts := map[int]map[string]int{}
+	unreachable := 0
+	localValues := map[string]int{}
+
+	start := time.Now()
+	for time.Since(start) < 3*time.Second {
+		// 本地档先读：kill 之后的第一读就是最早的一次旧值观测。
+		for _, id := range p.ids {
+			if id == leader {
+				continue
+			}
+			status, raw, err := p.get(id, key)
+			if err != nil || status != http.StatusOK {
+				continue
+			}
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				continue
+			}
+			value, _ := body["value"].(string)
+			localValues[valueTag(value)]++
+		}
+		for _, id := range p.ids {
+			status, raw, err := p.getLinear(id, key)
+			if err != nil {
+				// 旧 Leader 已经被 kill -9，连不上不是 HTTP 状态码，单独记。
+				unreachable++
+				continue
+			}
+			statusCounts[status]++
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Errorf("%s answered %d with a body that is not JSON: %s", id, status, firstBytes(raw, 200))
+				continue
+			}
+			if code, ok := body["code"].(string); ok && code != "" {
+				if codeCounts[status] == nil {
+					codeCounts[status] = map[string]int{}
+				}
+				codeCounts[status][code]++
+			}
+			if status != http.StatusOK {
+				continue
+			}
+			value, _ := body["value"].(string)
+			readIndex, _ := body["read_index"].(float64)
+			linear = append(linear, linearSample{node: id, tag: valueTag(value), readIndex: readIndex})
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	// 断言 1：缺省档的结果只有 200、503 not_leader、500 canceled 三种。
+	for status, count := range statusCounts {
+		switch status {
+		case http.StatusOK:
+		case http.StatusServiceUnavailable:
+			if codeCounts[status]["not_leader"] != count {
+				t.Errorf("the 503 answers carried the codes %v, want only not_leader", codeCounts[status])
+			}
+		case http.StatusInternalServerError:
+			if codeCounts[status]["canceled"] != count {
+				t.Errorf("the 500 answers carried the codes %v, want only canceled", codeCounts[status])
+			}
+		default:
+			t.Errorf("the default /get answered %d on %d observations, want only 200, 503 or 500", status, count)
+		}
+	}
+
+	// 断言 2 与 3：200 的值不能旧于最后一条已确认写，读索引不能小于那条写的日志 index，
+	// 而且读到的必须是读索引之前最后一条写的值——读索引落在哪条写上，读到的就得是哪条的值。
+	// 日志 index 从服务这次读的节点自己的 raft 日志里取：它是新 Leader，
+	// 日志里就是它提交过的那几条写（被杀的 Leader 盘上还留着它没提交出去的那几条）。
+	nodeIndexes := map[string]map[string]uint64{}
+	if len(linear) == 0 {
+		t.Errorf("the window saw no successful linear read at all")
+	}
+	highest := confirmedIndex
+	linearValues := map[string]int{}
+	for _, sample := range linear {
+		indexes, known := nodeIndexes[sample.node]
+		if !known {
+			indexes = raftLogValueIndex(p.root, sample.node, key)
+			nodeIndexes[sample.node] = indexes
+		}
+		index, known := indexes[sample.tag]
+		linearValues[sample.tag]++
+		if !known {
+			t.Errorf("the default /get answered the value %q that never entered %s's log", sample.tag, sample.node)
+			continue
+		}
+		if sample.readIndex < float64(index) {
+			t.Errorf("read_index %.0f is below the log index %d of the value %q",
+				sample.readIndex, index, sample.tag)
+		}
+		if float64(index) < confirmedIndex {
+			t.Errorf("the default /get answered the value %q whose log index %d is older than the last confirmed write at %.0f",
+				sample.tag, index, confirmedIndex)
+		}
+		if float64(index) < highest {
+			t.Errorf("the default /get answered the value %q at index %d after the value at index %.0f had been read",
+				sample.tag, index, highest)
+		}
+		if float64(index) > highest {
+			highest = float64(index)
+		}
+		// 读索引之前最后一条写：新 Leader 刚当选、还没提交任何新东西时，读索引仍停在已确认写上，
+		// 这时读到的就是那条已确认写的值；一旦读索引越过它，读到的必须是在途写里的某一条。
+		latest := uint64(0)
+		for _, other := range indexes {
+			if other <= uint64(sample.readIndex) && other > latest {
+				latest = other
+			}
+		}
+		if index != latest {
+			t.Errorf("the default /get answered the value %q at index %d with read_index %.0f, want the write at index %d",
+				sample.tag, index, sample.readIndex, latest)
+		}
+		if !inflightTags[sample.tag] && sample.readIndex > confirmedIndex {
+			t.Errorf("the default /get answered the pre-kill confirmed value %q with read_index %.0f, want one of the in-flight writes",
+				sample.tag, sample.readIndex)
+		}
+	}
+
+	// 断言 4：本地档读到过 kill 前那条已确认写的旧值。
+	// 在途写刚发出去、还没提交的那一读一定拿得到这个值；kill 之后那几台跟随者还停不停在旧值上，
+	// 取决于它们学到新 commitIndex 的时刻，这一格只报数不判成败。
+	if inFlightLocal != valueTag(confirmedValue) {
+		t.Errorf("the local档 read %q while the in-flight writes were not committed, want the pre-kill confirmed value %q",
+			inFlightLocal, valueTag(confirmedValue))
+	}
+
+	t.Logf("window=3s status_counts=%v codes=%v unreachable=%d linear_200=%d linear_values=%v local_values=%v local_inflight=%q",
+		statusCounts, codeCounts, unreachable, len(linear), linearValues, localValues, inFlightLocal)
+	t.Logf("killed=%s confirmed=%s@%.0f acked_inflight=%v killed_log_writes=%d",
+		leader, confirmedValue, confirmedIndex, ackedIndex, len(raftLogValueIndex(p.root, leader, key)))
+}
+
+// valueTag 取值的标签：在途写与已确认写的值都以固定前缀开头，标签就是那段前缀。
+// 值里垫了填充，窗口里的记录按标签比，就不必带着整条值走。
+func valueTag(value string) string {
+	if len(value) > 11 {
+		return value[:11]
+	}
+	return value
+}
+
+// raftLogValueIndex 扫节点盘上的 raft 日志，取出每个写入值的标签与它的日志 index。
+// 帧头 8 字节（len+crc），entry 是 op|term 8B|index 8B|command（3.1 §5）；
+// 尾部被 kill -9 截断的半条记录停在坏帧处，不往后读。
+func raftLogValueIndex(root, nodeID, key string) map[string]uint64 {
+	out := map[string]uint64{}
+	paths, err := filepath.Glob(filepath.Join(root, nodeID, RaftDirName, RaftLogDirName, "*.rlog"))
+	if err != nil {
+		return out
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		for off := 0; off+kvstore.FrameHeaderSize <= len(raw); {
+			size, checksum, err := kvstore.DecodeFrame(raw[off:off+kvstore.FrameHeaderSize], int64(off))
+			if err != nil {
+				break
+			}
+			end := off + kvstore.FrameHeaderSize + int(size)
+			if end > len(raw) {
+				break
+			}
+			payload := raw[off+kvstore.FrameHeaderSize : end]
+			if err := kvstore.CheckFrame(size, checksum, payload, int64(off)); err != nil {
+				break
+			}
+			_, index, cmd, err := decodeRaftEntry(payload, int64(off))
+			if err != nil {
+				break
+			}
+			if len(cmd) > 0 {
+				k, v, err := kvstore.DecodeEntry(cmd, int64(off))
+				if err == nil && k == key {
+					out[valueTag(v)] = index
+				}
+			}
+			off = end
+		}
+	}
+	return out
 }
 
 // 三档退出码的入口形状：配置非法与成员表里没有本 id 都是 2，

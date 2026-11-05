@@ -41,6 +41,13 @@ type httpCluster struct {
 
 func newHTTPCluster(t *testing.T, size int, lg *zap.Logger) *httpCluster {
 	t.Helper()
+	return newHTTPClusterCfg(t, size, lg, nil)
+}
+
+// newHTTPClusterCfg 在 newHTTPCluster 之上多一个改配置的钩子：读路径的开关与超时
+// 只有这一处能换（4.1 §6）。
+func newHTTPClusterCfg(t *testing.T, size int, lg *zap.Logger, mut func(*Config)) *httpCluster {
+	t.Helper()
 	c := &httpCluster{
 		t:    t,
 		node: map[string]*Node{}, kv: map[string]*kvstore.KV{},
@@ -70,6 +77,9 @@ func newHTTPCluster(t *testing.T, size int, lg *zap.Logger) *httpCluster {
 		cfg.Peers = peers
 		cfg.DataDir = t.TempDir()
 		cfg.LogLevel = "debug"
+		if mut != nil {
+			mut(&cfg)
+		}
 
 		kcfg := kvstore.DefaultConfig()
 		kcfg.DataDir = cfg.DataDir
@@ -220,9 +230,12 @@ func (c *httpCluster) putKV(id, key, value string) map[string]any {
 	return decodeMap(c.t, raw)
 }
 
+// getKV 走本地旧数据读那一档：这一格断言的是「每个节点各自 apply 过这条写」，
+// 与领导权无关，所以显式带 consistency=local（4.1 §4、D24）。
+// 线性一致读那一档另走默认参数，见 TestGetContractTwoConsistencyModes。
 func (c *httpCluster) getKV(id, key string) (int, string) {
 	c.t.Helper()
-	status, raw := c.get(id, "/get?key="+key)
+	status, raw := c.get(id, "/get?key="+key+"&consistency=local")
 	if status != http.StatusOK {
 		return status, ""
 	}
@@ -359,6 +372,166 @@ func TestLeaderCommitsWhileOnePeerIsDown(t *testing.T) {
 	}
 }
 
+// /get 的两档一致性：默认档是线性一致读，非 Leader 上回 503；
+// consistency=local 是显式请求的本地旧数据读，任意节点都回 200（4.1 §4、D24）。
+// 成功响应固定六键，503 的五个键与 /put 那格逐键相同。
+func TestGetContractTwoConsistencyModes(t *testing.T) {
+	c := newHTTPCluster(t, 5, zap.NewNop())
+	leader := c.waitForLeader(60)
+	follower := ""
+	for _, id := range c.ids {
+		if id != leader {
+			follower = id
+			break
+		}
+	}
+	c.putKV(leader, "k", "v")
+	c.tick(8)
+
+	// 默认档：Leader 上 200，六个键一个不多一个不少。
+	status, raw := c.get(leader, "/get?key=k")
+	if status != http.StatusOK {
+		t.Fatalf("linearizable get on the leader = %d: %s", status, raw)
+	}
+	body := decodeMap(t, raw)
+	if got := keysOf(body); got != "key,read_index,req_id,stale,term,value" {
+		t.Fatalf("get body keys = %q, want the six documented ones: %s", got, raw)
+	}
+	if body["value"] != "v" || body["key"] != "k" {
+		t.Fatalf("get body = %v, want k=v", body)
+	}
+	if body["stale"] != false {
+		t.Fatalf("stale = %v on a linearizable read, want false", body["stale"])
+	}
+	if index := body["read_index"].(float64); index < 1 {
+		t.Fatalf("read_index = %v, want at least 1: the leader committed the no-op", index)
+	}
+	if term := body["term"].(float64); term != float64(c.node[leader].Stats().Term) {
+		t.Fatalf("term = %v, want the leader's current term", term)
+	}
+
+	// 默认档在 Follower 上是 503：五个键与 /put 那格逐键相同。
+	status, raw = c.get(follower, "/get?key=k")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("linearizable get on follower %s = %d: %s", follower, status, raw)
+	}
+	refused := decodeMap(t, raw)
+	if refused["code"] != "not_leader" {
+		t.Fatalf("code = %v, want not_leader: %s", refused["code"], raw)
+	}
+	if got := keysOf(refused); got != "code,error,leader_addr,leader_id,req_id" {
+		t.Fatalf("not_leader body keys = %q, want the same five as /put: %s", got, raw)
+	}
+	if refused["leader_id"] != leader {
+		t.Fatalf("leader hint = %v, want %s", refused["leader_id"], leader)
+	}
+
+	// local 档：Follower 上也是 200，读索引回 0、stale 回 true。
+	status, raw = c.get(follower, "/get?key=k&consistency=local")
+	if status != http.StatusOK {
+		t.Fatalf("local get on follower %s = %d: %s", follower, status, raw)
+	}
+	local := decodeMap(t, raw)
+	if got := keysOf(local); got != "key,read_index,req_id,stale,term,value" {
+		t.Fatalf("local get body keys = %q, want the six documented ones: %s", got, raw)
+	}
+	if local["stale"] != true {
+		t.Fatalf("stale = %v on a local read, want true", local["stale"])
+	}
+	if index := local["read_index"].(float64); index != 0 {
+		t.Fatalf("read_index = %v on a local read, want 0: no confirmation happened", index)
+	}
+	if local["value"] != "v" {
+		t.Fatalf("local read value = %v, want v: the follower applied the committed entry", local["value"])
+	}
+}
+
+// consistency 只取两个值，其余一律 400；非 GET 方法在 /get 上是 405（4.1 §4）。
+func TestGetRejectsAnUnknownConsistency(t *testing.T) {
+	c := newHTTPCluster(t, 1, zap.NewNop())
+	id := c.ids[0]
+
+	status, raw := c.get(id, "/get?key=k&consistency=bogus")
+	if status != http.StatusBadRequest {
+		t.Fatalf("unknown consistency = %d: %s", status, firstBytes(raw, 200))
+	}
+	if code := decodeMap(t, raw)["code"]; code != "bad_request" {
+		t.Fatalf("code = %v, want bad_request", code)
+	}
+
+	status, raw = c.post(id, "/get", `{"key":"k"}`)
+	if status != http.StatusMethodNotAllowed {
+		t.Fatalf("POST on /get = %d: %s", status, firstBytes(raw, 200))
+	}
+}
+
+// append-entries 的 readRound 在必填之列：缺了 400，带 0 通过；Follower 原样回显（4.1 §4、D25）。
+func TestAppendEntriesRequiresReadRound(t *testing.T) {
+	c := newHTTPCluster(t, 1, zap.NewNop())
+	id := c.ids[0]
+
+	body := `{"term":3,"leaderId":"node-9","prevLogIndex":0,"prevLogTerm":0,"entries":[],"leaderCommit":0`
+	status, raw := c.post(id, "/raft/append-entries", body+"}")
+	if status != http.StatusBadRequest {
+		t.Fatalf("append without readRound = %d: %s", status, firstBytes(raw, 200))
+	}
+	if code := decodeMap(t, raw)["code"]; code != "bad_request" {
+		t.Fatalf("code = %v, want bad_request", code)
+	}
+
+	status, raw = c.post(id, "/raft/append-entries", body+`,"readRound":0}`)
+	if status != http.StatusOK {
+		t.Fatalf("append with readRound 0 = %d: %s", status, raw)
+	}
+	if reply := decodeMap(t, raw); reply["readRound"] != float64(0) {
+		t.Fatalf("reply readRound = %v, want the request's 0", reply["readRound"])
+	}
+
+	status, raw = c.post(id, "/raft/append-entries", body+`,"readRound":7}`)
+	if status != http.StatusOK {
+		t.Fatalf("append with readRound 7 = %d: %s", status, raw)
+	}
+	if reply := decodeMap(t, raw); reply["readRound"] != float64(7) {
+		t.Fatalf("reply readRound = %v, want the request's 7: the follower must echo it", reply["readRound"])
+	}
+}
+
+// 读超时的上界由 -read-timeout-ms 给：确认轮凑不齐多数派时这条读拿 500 canceled，
+// applyWaiters 里不留唤醒不了的等待（4.1 §7、D28）。
+func TestGetTimesOutWhenTheConfirmationCannotSettle(t *testing.T) {
+	c := newHTTPClusterCfg(t, 3, zap.NewNop(), func(cfg *Config) {
+		cfg.ReadTimeoutMS = 50
+	})
+	leader := c.waitForLeader(60)
+
+	// 两个对端都停掉：确认轮拿不到多数派的票，读只能等超时。
+	for _, id := range c.ids {
+		if id != leader {
+			c.stopNode(id)
+		}
+	}
+
+	status, raw := c.get(leader, "/get?key=k")
+	if status != http.StatusInternalServerError {
+		t.Fatalf("get without a majority = %d: %s", status, firstBytes(raw, 200))
+	}
+	body := decodeMap(t, raw)
+	if body["code"] != "canceled" {
+		t.Fatalf("code = %v, want canceled: %s", body["code"], firstBytes(raw, 200))
+	}
+	if body["value"] != nil {
+		t.Fatalf("a failed read must not carry a value: %s", raw)
+	}
+
+	n := c.node[leader]
+	n.mu.Lock()
+	waiters := len(n.applyWaiters)
+	n.mu.Unlock()
+	if waiters != 0 {
+		t.Fatalf("applyWaiters holds %d entries after the timeout, want none", waiters)
+	}
+}
+
 // 线上形状逐项核对：字段名、类型，以及 conflictTerm 的空值是 JSON 的 null 而不是 0（3.1 §4）。
 func TestRPCWireShape(t *testing.T) {
 	c := newHTTPCluster(t, 1, zap.NewNop())
@@ -388,13 +561,13 @@ func TestRPCWireShape(t *testing.T) {
 	}
 
 	status, raw = c.post(id, "/raft/append-entries",
-		`{"term":5,"leaderId":"node-9","prevLogIndex":5,"prevLogTerm":5,"entries":[],"leaderCommit":0}`)
+		`{"term":5,"leaderId":"node-9","prevLogIndex":5,"prevLogTerm":5,"entries":[],"leaderCommit":0,"readRound":0}`)
 	if status != http.StatusOK {
 		t.Fatalf("append-entries = %d: %s", status, raw)
 	}
 	app := decodeMap(t, raw)
-	if got := keysOf(app); got != "conflictIndex,conflictTerm,success,term" {
-		t.Fatalf("append reply keys = %q, want conflictIndex,conflictTerm,success,term: %s", got, raw)
+	if got := keysOf(app); got != "conflictIndex,conflictTerm,readRound,success,term" {
+		t.Fatalf("append reply keys = %q, want conflictIndex,conflictTerm,readRound,success,term: %s", got, raw)
 	}
 	if app["term"] != float64(5) || app["success"] != false || app["conflictIndex"] != float64(1) {
 		t.Fatalf("append reply = %v, want term 5, success false, conflictIndex 1", app)
@@ -406,7 +579,7 @@ func TestRPCWireShape(t *testing.T) {
 	// command 是不透明字节：这串 base64 解不成 kv 条目，raft 照样收下，因为它一个字节都不解（D4）。
 	status, raw = c.post(id, "/raft/append-entries",
 		`{"term":5,"leaderId":"node-9","prevLogIndex":0,"prevLogTerm":0,`+
-			`"entries":[{"term":5,"index":1,"command":"bm90LWEta3YtZW50cnk="}],"leaderCommit":0}`)
+			`"entries":[{"term":5,"index":1,"command":"bm90LWEta3YtZW50cnk="}],"leaderCommit":0,"readRound":0}`)
 	if status != http.StatusOK {
 		t.Fatalf("append with an opaque command = %d: %s", status, raw)
 	}

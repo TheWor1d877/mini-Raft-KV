@@ -26,6 +26,11 @@ const (
 	DefaultHeartbeatMS       = int64(100)
 	DefaultTickMS            = int64(50)
 
+	// 读路径三个开关的默认值（4.1 §6）。
+	DefaultReadMode      = ReadModeLease
+	DefaultClockDriftMS  = int64(50)
+	DefaultReadTimeoutMS = int64(1000)
+
 	RaftDirName      = "raft"
 	RaftLogDirName   = "log"
 	StateFileName    = "state"
@@ -43,8 +48,19 @@ const (
 	ComponentRaftLog = "raftlog"
 )
 
+// ReadMode 是节点级的默认线性读法：lease 走领导权租约，readindex 走逐读确认轮（4.1 §6）。
+// 它与请求级的 Consistency 是两条轴：Consistency 决定这条读要不要领导权确认，
+// ReadMode 决定线性读走租约还是逐读确认。
+type ReadMode string
+
+const (
+	ReadModeLease     ReadMode = "lease"
+	ReadModeReadIndex ReadMode = "readindex"
+)
+
 // Config 装 raft 层的参数与路径。九项字段在 M10 的 T21.1 一次建全，
 // M12 的 T25.1 只做 flag 解析与 -peers 成员集合一致性检查，不再动结构体（3.1 §6）。
+// M14 的 T29.2 加读路径三项（4.1 §6）。
 type Config struct {
 	NodeID string
 	// Peers 是 id→host:port 的静态成员表，必须含 NodeID 自己；节点数 N 取它的长度。
@@ -56,6 +72,12 @@ type Config struct {
 	MaxFileSize       int64
 	Fsync             bool
 	LogLevel          string
+
+	// ReadMode 是节点级默认读法；ClockDriftMS 是租约的时钟漂移余量；
+	// ReadTimeoutMS 是单次线性读从登记到返回的上界（4.1 §6）。
+	ReadMode      ReadMode
+	ClockDriftMS  int64
+	ReadTimeoutMS int64
 }
 
 func DefaultConfig() Config {
@@ -66,6 +88,9 @@ func DefaultConfig() Config {
 		MaxFileSize:       kvstore.DefaultMaxFileSize,
 		Fsync:             true,
 		LogLevel:          DefaultLogLevel,
+		ReadMode:          DefaultReadMode,
+		ClockDriftMS:      DefaultClockDriftMS,
+		ReadTimeoutMS:     DefaultReadTimeoutMS,
 	}
 }
 
@@ -147,6 +172,31 @@ func (c Config) Validate() error {
 	if _, err := parseLogLevel(c.LogLevel); err != nil {
 		return err
 	}
+	switch c.ReadMode {
+	case ReadModeLease, ReadModeReadIndex:
+	default:
+		return fmt.Errorf("read mode %q must be %s or %s", c.ReadMode, ReadModeLease, ReadModeReadIndex)
+	}
+	if c.ClockDriftMS < 0 {
+		return fmt.Errorf("clock drift %dms must not be negative", c.ClockDriftMS)
+	}
+	if c.ReadTimeoutMS <= 0 {
+		return fmt.Errorf("read timeout %dms must be positive", c.ReadTimeoutMS)
+	}
+	// 一轮广播的最坏耗时是 (N-1) 次串行 RPC（4.1 §6、D23）。
+	broadcastMS := int64(len(c.Peers)-1) * c.rpcTimeout().Milliseconds()
+	switch c.ReadMode {
+	case ReadModeLease:
+		// 租约窗口要长过一轮广播，否则确认还没回来租约已经过期，Lease Read 一次也命中不了。
+		if window := c.ElectionTimeoutMS - c.ClockDriftMS; window <= broadcastMS {
+			return fmt.Errorf("lease window %dms is not longer than one broadcast %dms", window, broadcastMS)
+		}
+	case ReadModeReadIndex:
+		// 读超时短过一轮广播，读会在确认回来之前就超时。
+		if c.ReadTimeoutMS < broadcastMS {
+			return fmt.Errorf("read timeout %dms is shorter than one broadcast %dms", c.ReadTimeoutMS, broadcastMS)
+		}
+	}
 	return nil
 }
 
@@ -176,7 +226,7 @@ func Load(args []string) (Config, kvstore.Config, error) {
 	cfg := DefaultConfig()
 	kcfg := kvstore.DefaultConfig()
 
-	var nodeID, peersFlag, addrFlag, dataDir string
+	var nodeID, peersFlag, addrFlag, dataDir, readMode string
 	fs := flag.NewFlagSet("miniraft-node", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&nodeID, "node-id", "", "member id, must appear in -peers")
@@ -190,9 +240,13 @@ func Load(args []string) (Config, kvstore.Config, error) {
 	fs.IntVar(&kcfg.BatchSize, "batch-size", kcfg.BatchSize, "kv wal records per fsync batch")
 	fs.Int64Var(&cfg.MaxFileSize, "max-file-size", cfg.MaxFileSize, "bytes per segment file before rollover, raft log and kv wal")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "debug, info, warn, error, panic, fatal")
+	fs.StringVar(&readMode, "read-mode", string(cfg.ReadMode), "linearizable read path: lease or readindex")
+	fs.Int64Var(&cfg.ClockDriftMS, "clock-drift-ms", cfg.ClockDriftMS, "clock drift margin taken off the lease window")
+	fs.Int64Var(&cfg.ReadTimeoutMS, "read-timeout-ms", cfg.ReadTimeoutMS, "upper bound of one linearizable read")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, kvstore.Config{}, err
 	}
+	cfg.ReadMode = ReadMode(readMode)
 
 	peers, err := parsePeers(peersFlag)
 	if err != nil {

@@ -427,3 +427,111 @@ func TestAppendDeniedLogFields(t *testing.T) {
 		t.Errorf("next_index = %v, want 1", withoutTerm["next_index"])
 	}
 }
+
+// startReadRound 在 Leader 上摆一轮在途确认：编号 round，成员是一条排队的读。
+// 回执由用例自己往这一轮上灌，计票与结算在这一轮上都看得见（4.1 §7）。
+func startReadRound(n *Node, round uint64) readWaiter {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	waiter := n.registerReadLocked()
+	n.readQueue = n.readQueue[:0]
+	n.activeRound = &activeRound{round: round, term: n.term, startNS: n.now(), acks: 1, members: []readWaiter{waiter}}
+	return waiter
+}
+
+// appendOnce 在在途确认轮存在时把本轮编号带上，没有在途轮次时填 0（4.1 §7、D25、4.2 §3 的 append 行）。
+func TestAppendOnceCarriesReadRoundOnlyWhileARoundIsInFlight(t *testing.T) {
+	_, n, _ := leaderFixture(t)
+
+	n.mu.Lock()
+	n.appendOnce("node-3")
+	without := *n.outbox[0].app
+	n.activeRound = &activeRound{round: 7, term: n.term, startNS: n.now(), acks: 1}
+	n.appendOnce("node-3")
+	with := *n.outbox[1].app
+	n.mu.Unlock()
+
+	if without.ReadRound != 0 {
+		t.Errorf("read round without a round in flight = %d, want 0", without.ReadRound)
+	}
+	if with.ReadRound != 7 {
+		t.Errorf("read round with a round in flight = %d, want 7", with.ReadRound)
+	}
+}
+
+// 带条目的同任期 success 回执同样计票；票到多数派当场结算（4.1 §7、4.2 §3 的 append 行）。
+func TestAppendReplyWithEntriesAlsoCountsForTheReadRound(t *testing.T) {
+	_, n, logs := leaderFixture(t)
+	waiter := startReadRound(n, 7)
+
+	n.mu.Lock()
+	mustAppend(t, n.log, n.term, 3, "")
+	req := AppendRequest{Term: 3, LeaderID: "node-1", PrevLogIndex: 2, PrevLogTerm: 3,
+		Entries: []LogEntry{{Term: 3, Index: 3}}}
+	n.handleAppendReply("node-2", req, AppendReply{Term: 3, Success: true, ReadRound: 7})
+	acks := n.activeRound.acks
+	n.mu.Unlock()
+
+	if acks != 2 {
+		t.Fatalf("acks after one reply = %d, want 2: a reply carrying entries counts too", acks)
+	}
+
+	n.mu.Lock()
+	n.handleAppendReply("node-3", req, AppendReply{Term: 3, Success: true, ReadRound: 7})
+	settled := n.activeRound == nil
+	n.mu.Unlock()
+	if !settled {
+		t.Fatal("the round did not settle at the majority")
+	}
+
+	entry := logs.FilterMessage("read round settled").All()
+	if len(entry) != 1 {
+		t.Fatalf("read round settled entries = %d, want 1", len(entry))
+	}
+	if got := entry[0].ContextMap()["acks"]; got != int64(3) {
+		t.Errorf("acks = %v, want 3: the leader's own vote plus two peers", got)
+	}
+	res := <-waiter.wait
+	if res.err != nil {
+		t.Fatalf("the read in that round: %v", res.err)
+	}
+
+	// 后到的票不改已经定下的读索引：那一轮已经结算，回执没有轮次可归（D25）。
+	n.mu.Lock()
+	n.handleAppendReply("node-4", req, AppendReply{Term: 3, Success: true, ReadRound: 7})
+	stillSettled := n.activeRound == nil
+	n.mu.Unlock()
+	if !stillSettled {
+		t.Fatal("a late vote opened a round again")
+	}
+	if got := entry[0].ContextMap()["read_index"]; got != uint64(res.readIndex) {
+		t.Errorf("settled read index = %v, want %d", got, res.readIndex)
+	}
+	select {
+	case got := <-waiter.wait:
+		t.Fatalf("a late vote changed the settled result: %+v", got)
+	default:
+	}
+}
+
+// readRound 为 0 的回执不进读路径的计数，复制游标照旧推进（4.2 §3 的 append 行）。
+func TestAppendReplyWithoutReadRoundDoesNotCountButAdvancesCursors(t *testing.T) {
+	_, n, _ := leaderFixture(t)
+	startReadRound(n, 7)
+
+	n.mu.Lock()
+	mustAppend(t, n.log, n.term, 3, "")
+	req := AppendRequest{Term: 3, LeaderID: "node-1", PrevLogIndex: 2, PrevLogTerm: 3,
+		Entries: []LogEntry{{Term: 3, Index: 3}}}
+	n.handleAppendReply("node-2", req, AppendReply{Term: 3, Success: true})
+	acks := n.activeRound.acks
+	match, next := n.matchIndex["node-2"], n.nextIndex["node-2"]
+	n.mu.Unlock()
+
+	if acks != 1 {
+		t.Errorf("acks = %d, want 1: a reply without a round number does not count", acks)
+	}
+	if match != 3 || next != 4 {
+		t.Errorf("matchIndex／nextIndex = %d／%d, want 3／4: the replication cursors move anyway", match, next)
+	}
+}
