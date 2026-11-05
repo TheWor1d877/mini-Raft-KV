@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -36,6 +37,65 @@ func kvConfig(t *testing.T) Config {
 	cfg.DataDir = t.TempDir()
 	cfg.LogLevel = "debug"
 	return cfg
+}
+
+// 导出面：Snapshot() 给出全量键值且顺序稳定，Restore() 整体替换 map（5.1 §3）。
+func TestSnapshotExportsEveryPairInKeyOrder(t *testing.T) {
+	k, _ := openKV(t, kvConfig(t))
+	k.Apply("b", "2")
+	k.Apply("a", "1")
+	k.Apply("c", "")
+
+	want := []Entry{{Key: "a", Value: "1"}, {Key: "b", Value: "2"}, {Key: "c", Value: ""}}
+	first, second := k.Snapshot(), k.Snapshot()
+	if len(first) != len(want) {
+		t.Fatalf("exported %d entries, want %d", len(first), len(want))
+	}
+	for i := range want {
+		if first[i] != want[i] {
+			t.Fatalf("export %d = %+v, want %+v: the order must be ascending by key", i, first[i], want[i])
+		}
+	}
+	if !slices.Equal(first, second) {
+		t.Fatalf("the second export differs from the first: %+v vs %+v", first, second)
+	}
+
+	k.Restore(first)
+	if got := k.Snapshot(); !slices.Equal(got, want) {
+		t.Fatalf("export after restoring the same content = %+v, want %+v", got, want)
+	}
+}
+
+// 空状态机的导出是空切片；Restore 之后被替换掉的键读不到，留下的键读得到快照里的值。
+func TestRestoreReplacesTheWholeMap(t *testing.T) {
+	k, _ := openKV(t, kvConfig(t))
+
+	if got := k.Snapshot(); len(got) != 0 {
+		t.Fatalf("export of an empty state machine = %+v, want no entries", got)
+	}
+
+	k.Apply("drop", "old")
+	k.Apply("keep", "old")
+	k.Restore([]Entry{{Key: "keep", Value: "new"}})
+
+	if _, err := k.Get("drop"); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("the replaced key is still readable: %v", err)
+	}
+	value, err := k.Get("keep")
+	if err != nil || value != "new" {
+		t.Fatalf(`Get(keep) = %q %v, want the snapshot value "new"`, value, err)
+	}
+	if got := k.Snapshot(); len(got) != 1 || got[0] != (Entry{Key: "keep", Value: "new"}) {
+		t.Fatalf("export after the replace = %+v, want the one entry the snapshot carried", got)
+	}
+
+	k.Restore(nil)
+	if got := k.Snapshot(); len(got) != 0 {
+		t.Fatalf("export after an empty restore = %+v, want no entries", got)
+	}
+	if _, err := k.Get("keep"); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("a restore of nothing left a key behind: %v", err)
+	}
 }
 
 func TestGetMissingKeyIsErrKeyNotFound(t *testing.T) {

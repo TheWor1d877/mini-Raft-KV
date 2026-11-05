@@ -39,8 +39,8 @@ func ErrStateMismatchAt(index uint64, reason string) error {
 var errWALDisabled = fmt.Errorf("wal disabled by an earlier fsync failure: %w", kvstore.ErrIO)
 
 // handler 侧的类别映射：只按哨兵判，不看错误文本（与 2.1 §4 同口径）。
-// ErrStateMismatch 不给专门的 code：它是「复制逻辑已经错了」级别的信号，落到 internal 那一档，
-// 原文进日志，响应体只带类别。
+// ErrStateMismatch 有专门的 code state_mismatch（5.1 §4）：它有两类来源，
+// 一类是节点状态没到（快照点选不出来），一类是复制逻辑已经错了。
 func statusFor(err error) (int, string) {
 	switch {
 	case errors.Is(err, ErrNotLeader):
@@ -55,6 +55,9 @@ func statusFor(err error) (int, string) {
 		return http.StatusInternalServerError, "corrupt_record"
 	case errors.Is(err, kvstore.ErrIO):
 		return http.StatusInternalServerError, "io_error"
+	case errors.Is(err, ErrStateMismatch):
+		// 快照点选不出来这一类：请求本身没问题，是节点的状态还没到（5.1 §4）。
+		return http.StatusConflict, "state_mismatch"
 	default:
 		return http.StatusInternalServerError, "internal"
 	}

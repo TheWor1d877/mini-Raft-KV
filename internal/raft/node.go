@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"sync"
 
@@ -86,6 +87,8 @@ type AppendReply struct {
 type Transport interface {
 	RequestVote(to string, req VoteRequest) (VoteReply, error)
 	AppendEntries(to string, req AppendRequest) (AppendReply, error)
+	// InstallSnapshot 补发一份快照：请求体是快照文件的原始字节（5.1 §4、D32）。
+	InstallSnapshot(to string, index, term uint64, body []byte) error
 }
 
 // rpcTask 是 outbox 里的一次发送。调用一律在 Node 锁外发起，回执在同一调用栈里当场处理（D23）。
@@ -94,6 +97,7 @@ type rpcTask struct {
 	peerID string
 	vote   *VoteRequest
 	app    *AppendRequest
+	snap   *snapshotTask
 }
 
 // Node 是一个 raft 节点，一个进程一个（D17）。
@@ -107,6 +111,14 @@ type Node struct {
 	mu    sync.Mutex
 	state *stateFile
 	log   *wal
+	// snap 是快照文件与元数据指针的读写句柄；snapshotIndex 是当前快照点（5.1 §2）。
+	snap          *snapshotter
+	snapshotIndex uint64
+	snapshotTerm  uint64
+	// snapshotting 挡住并发的第二次快照生成：同一时刻一个节点只生成一个快照（不变式 4）。
+	snapshotting bool
+	// lastSnapshotMS 是上一次快照生成的时刻，最小间隔按它算（5.1 §7 的触发）。
+	lastSnapshotMS int64
 
 	role        Role
 	term        uint64
@@ -163,11 +175,24 @@ func NewNode(cfg Config, kv *kvstore.KV, tp Transport, lg *zap.Logger) (*Node, e
 	if err != nil {
 		return nil, err
 	}
-	rl, err := openWAL(cfg, lg)
+	// 启动恢复的四步（5.1 §7）：先读指针与快照，再按快照给日志一个基线。
+	// 快照的四种坏输入都由 snapshotter 自己报警并按「没有快照」返回（5.1 §4 的 load 行）。
+	snapper := newSnapshotter(cfg, lg)
+	snap, snapEntries, _ := snapper.load()
+	baseIndex, baseTerm := uint64(1), uint64(0)
+	if snap != nil {
+		baseIndex, baseTerm = snap.Index+1, snap.Term
+	}
+	rl, err := openWALFrom(cfg, lg, baseIndex, baseTerm)
 	if err != nil {
+		if snap == nil {
+			// 没有可用的快照，日志又接不上它：日志前缀已经删掉，快照是唯一的一份，
+			// 起空 map 就是静默丢数据，这一格直接判启动失败。
+			return nil, fmt.Errorf("no usable snapshot and the wal cannot be replayed from its first entry: %w", err)
+		}
 		return nil, err
 	}
-	if err := checkCursors(st, rl.lastIndex()); err != nil {
+	if err := checkCursors(st, rl.lastIndex(), snapshotIndexOf(snap)); err != nil {
 		_ = rl.close()
 		return nil, err
 	}
@@ -179,6 +204,9 @@ func NewNode(cfg Config, kv *kvstore.KV, tp Transport, lg *zap.Logger) (*Node, e
 		lg:             kvstore.WithComponent(lg, ComponentRaft),
 		state:          newStateFile(cfg, lg),
 		log:            rl,
+		snap:           snapper,
+		snapshotIndex:  snapshotIndexOf(snap),
+		snapshotTerm:   snapshotTermOf(snap),
 		role:           RoleFollower,
 		term:           st.CurrentTerm,
 		votedFor:       st.VotedFor,
@@ -192,7 +220,11 @@ func NewNode(cfg Config, kv *kvstore.KV, tp Transport, lg *zap.Logger) (*Node, e
 		leaseWindow:    leaseWindow(cfg),
 	}
 	n.electionDeadline = n.rollElectionDeadline()
-	// 启动序列的第一步：map 由日志回放重建，KV WAL 不参与恢复（docs/8 第 1 步）。
+	// 启动序列的第二步：状态机先由快照重建，快照点之前的状态只从快照来（不变式 7）。
+	if snap != nil {
+		n.kv.Restore(snapEntries)
+	}
+	// 启动序列的第三步：map 由日志回放重建，KV WAL 不参与恢复（docs/8 第 1 步）。
 	if err := n.replayLog(); err != nil {
 		_ = n.log.close()
 		return nil, err
@@ -214,6 +246,10 @@ func (n *Node) replayLog() error {
 		if e.index > n.lastApplied {
 			break
 		}
+		// 快照点之前的条目不进状态机：那段状态由快照给出（不变式 3）。
+		if e.index <= n.snapshotIndex {
+			continue
+		}
 		if len(e.cmd) == 0 {
 			continue
 		}
@@ -233,14 +269,35 @@ func (n *Node) replayLog() error {
 
 // checkCursors 挡的是 state 与 raft 日志对不上的那一格（不变式 4 的下半段）：
 // 游标比日志还长，说明两个文件里至少有一个不是同一次提交的产物。
-func checkCursors(st State, lastLogIndex uint64) error {
-	if st.CommitIndex > lastLogIndex {
+func checkCursors(st State, lastLogIndex, snapshotIndex uint64) error {
+	// 日志前缀可能被压缩掉：提交点的上界取日志末尾与快照点两者的较大值。
+	bound := max(lastLogIndex, snapshotIndex)
+	if st.CommitIndex > bound {
 		return ErrStateMismatchAt(st.CommitIndex, "commitIndex is past the end of the wal")
 	}
 	if st.LastApplied > st.CommitIndex {
 		return ErrStateMismatchAt(st.LastApplied, "lastApplied is past commitIndex")
 	}
+	if st.LastApplied < snapshotIndex {
+		return ErrStateMismatchAt(snapshotIndex, "the snapshot is ahead of lastApplied")
+	}
 	return nil
+}
+
+// snapshotIndexOf 取快照的 index，没有可用快照时是 0。
+func snapshotIndexOf(snap *Snapshot) uint64 {
+	if snap == nil {
+		return 0
+	}
+	return snap.Index
+}
+
+// snapshotTermOf 取快照点上的 term，没有可用快照时是 0。
+func snapshotTermOf(snap *Snapshot) uint64 {
+	if snap == nil {
+		return 0
+	}
+	return snap.Term
 }
 
 // ticks 把毫秒换算成 tick 数，向下取整、至少 1（3.1 §6）。
@@ -288,10 +345,13 @@ func (n *Node) Tick() {
 	n.drainOutbox()
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	if err := n.applyCommitted(); err != nil {
 		n.logApplyFailure(err)
 	}
+	n.mu.Unlock()
+
+	// 自动触发放在锁外：生成快照要写文件，持锁做会挡住整条写路径（5.1 §7 的触发）。
+	n.maybeTriggerSnapshot()
 }
 
 // drainOutbox 串行跑完 outbox 里的每一条：发送与等回执都不持锁（D23、3.1 §4）。
@@ -345,6 +405,21 @@ func (n *Node) runTask(task rpcTask) {
 		}
 		n.mu.Lock()
 		n.handleVoteReply(req, reply)
+		n.mu.Unlock()
+
+	case task.snap != nil:
+		// 补发快照：字节在锁外从本地文件读，读完再发（5.1 §7）。
+		body, err := n.snap.readSnapshotBytes(task.snap.index)
+		if err != nil {
+			n.logSendFailed("install snapshot failed", task.peerID, task.snap.term, err)
+			return
+		}
+		if err := n.tp.InstallSnapshot(addr, task.snap.index, task.snap.term, body); err != nil {
+			n.logSendFailed("install snapshot failed", task.peerID, task.snap.term, err)
+			return
+		}
+		n.mu.Lock()
+		n.handleInstallReply(task.peerID, task.snap.index)
 		n.mu.Unlock()
 
 	default:

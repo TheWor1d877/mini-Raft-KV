@@ -719,6 +719,136 @@ func (c *httpCluster) breakSync(id string) {
 	c.broken[id] = true
 }
 
+// POST /raft/snapshot 的形状（5.1 §4 形状表）：Leader 上 200 带 snapshot_index 与 entries，
+// Follower 上 503 not_leader，快照点选不出来 409 state_mismatch。
+func TestSnapshotRouteShape(t *testing.T) {
+	c := newHTTPCluster(t, 3, zap.NewNop())
+	leaderID := c.waitForLeader(60)
+	followerID := ""
+	for _, id := range c.ids {
+		if id != leaderID {
+			followerID = id
+			break
+		}
+	}
+
+	for _, key := range []string{"k1", "k2", "k3"} {
+		c.putKV(leaderID, key, "v-"+key)
+	}
+	c.tick(4)
+	for _, key := range []string{"k1", "k2", "k3"} {
+		if status, value := c.getKV(leaderID, key); status != http.StatusOK || value != "v-"+key {
+			t.Fatalf("the precondition broke: Get(%s) on the leader = %d %q", key, status, value)
+		}
+	}
+	applied := c.node[leaderID].Stats().LastApplied
+
+	status, raw := c.post(leaderID, "/raft/snapshot", "")
+	if status != http.StatusOK {
+		t.Fatalf("snapshot on the leader = %d: %s", status, firstBytes(raw, 200))
+	}
+	body := decodeMap(t, raw)
+	if got := keysOf(body); got != "entries,ok,snapshot_index" {
+		t.Fatalf("reply keys = %s, want entries,ok,snapshot_index", got)
+	}
+	if body["ok"] != true {
+		t.Fatalf("ok = %v, want true", body["ok"])
+	}
+	if got := body["snapshot_index"]; got != float64(applied) {
+		t.Fatalf("snapshot_index = %v, want lastApplied %d", got, applied)
+	}
+	if got := body["entries"]; got != float64(3) {
+		t.Fatalf("entries = %v, want the three keys in the state machine", got)
+	}
+
+	status, raw = c.post(followerID, "/raft/snapshot", "")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("snapshot on a follower = %d: %s", status, firstBytes(raw, 200))
+	}
+	if got := decodeMap(t, raw)["code"]; got != "not_leader" {
+		t.Fatalf("follower code = %v, want not_leader", got)
+	}
+
+	// 快照点选不出来的 Leader 回 409：把 apply 位置压回 0，选点的那一步就断了。
+	solo := newHTTPCluster(t, 1, zap.NewNop())
+	soloLeader := solo.waitForLeader(60)
+	solo.node[soloLeader].mu.Lock()
+	solo.node[soloLeader].lastApplied = 0
+	solo.node[soloLeader].mu.Unlock()
+	status, raw = solo.post(soloLeader, "/raft/snapshot", "")
+	if status != http.StatusConflict {
+		t.Fatalf("snapshot without a point = %d: %s", status, firstBytes(raw, 200))
+	}
+	if got := decodeMap(t, raw)["code"]; got != "state_mismatch" {
+		t.Fatalf("code = %v, want state_mismatch", got)
+	}
+}
+
+// POST /raft/install-snapshot 的形状（5.1 §4 形状表、D32）：query 缺参数 400，
+// 快照字节校验不符 500 corrupt_record，成功回执带 snapshot_index，
+// 落盘的快照文件与发出的原始字节逐字节相同。
+func TestInstallSnapshotRouteShape(t *testing.T) {
+	c := newHTTPCluster(t, 1, zap.NewNop())
+	id := c.ids[0]
+
+	for _, query := range []string{"", "?index=2", "?term=1"} {
+		status, raw := c.post(id, "/raft/install-snapshot"+query, "not a snapshot")
+		if status != http.StatusBadRequest {
+			t.Fatalf("install with query %q = %d: %s", query, status, firstBytes(raw, 200))
+		}
+		if got := decodeMap(t, raw)["code"]; got != "bad_request" {
+			t.Fatalf("install with query %q: code = %v, want bad_request", query, got)
+		}
+	}
+
+	body := snapshotBody(t, "snap", "sv")
+	garbled := bytes.Clone(body)
+	garbled[len(garbled)-1] ^= 0xff
+	status, raw := c.post(id, "/raft/install-snapshot?index=2&term=1", string(garbled))
+	if status != http.StatusInternalServerError {
+		t.Fatalf("install of a corrupt snapshot = %d: %s", status, firstBytes(raw, 200))
+	}
+	if got := decodeMap(t, raw)["code"]; got != "corrupt_record" {
+		t.Fatalf("code = %v, want corrupt_record", got)
+	}
+	if _, err := os.Stat(c.node[id].cfg.SnapshotPath(2)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the rejected snapshot reached the disk: %v", err)
+	}
+
+	status, raw = c.post(id, "/raft/install-snapshot?index=2&term=1", string(body))
+	if status != http.StatusOK {
+		t.Fatalf("install of a valid snapshot = %d: %s", status, firstBytes(raw, 200))
+	}
+	reply := decodeMap(t, raw)
+	if got := keysOf(reply); got != "ok,snapshot_index" {
+		t.Fatalf("reply keys = %s, want ok,snapshot_index", got)
+	}
+	if reply["ok"] != true || reply["snapshot_index"] != float64(2) {
+		t.Fatalf("reply = %v, want ok with snapshot_index 2", reply)
+	}
+	// 请求体是原始字节：落盘的那一份与发出去的一字不差。
+	onDisk, err := os.ReadFile(c.node[id].cfg.SnapshotPath(2))
+	if err != nil {
+		t.Fatalf("read the installed snapshot: %v", err)
+	}
+	if !bytes.Equal(onDisk, body) {
+		t.Fatalf("the snapshot on disk differs from the bytes sent: %d vs %d bytes", len(onDisk), len(body))
+	}
+	if status, value := c.getKV(id, "snap"); status != http.StatusOK || value != "sv" {
+		t.Fatalf("Get(snap) after the install = %d %q, want sv", status, value)
+	}
+
+	if status, raw := c.get(id, "/raft/snapshot"); status != http.StatusMethodNotAllowed {
+		t.Fatalf("GET on /raft/snapshot = %d: %s", status, firstBytes(raw, 200))
+	}
+	if status, raw := c.get(id, "/raft/install-snapshot"); status != http.StatusMethodNotAllowed {
+		t.Fatalf("GET on /raft/install-snapshot = %d: %s", status, firstBytes(raw, 200))
+	}
+	if status, raw := c.post(id, "/raft/snapshot-nope", ""); status != http.StatusNotFound {
+		t.Fatalf("unknown route = %d: %s", status, firstBytes(raw, 200))
+	}
+}
+
 func firstBytes(raw []byte, n int) string {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) > n {

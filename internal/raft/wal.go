@@ -76,6 +76,11 @@ type wal struct {
 
 	entries []*walEntry
 
+	// baseIndex 是视图里第一条条目的 index：压缩之后日志不再从 1 起（5.1 §5）。
+	// baseTerm 是那条位置上的 term，日志为空时 lastTerm 靠它回答投票请求。
+	baseIndex uint64
+	baseTerm  uint64
+
 	// D20 的两个映射：Follower 回 conflictIndex 用首条，Leader 反查 nextIndex 用末条。
 	firstIndexByTerm map[uint64]uint64
 	lastIndexByTerm  map[uint64]uint64
@@ -87,11 +92,17 @@ type wal struct {
 // openWAL 先扫描重建视图，再在最大序号文件末尾准备追加（3.1 §7）。
 // 扫描会就地裁剪坏尾，所以列段放在扫描之后，拿到的才是裁剪后的长度。
 func openWAL(cfg Config, lg *zap.Logger) (*wal, error) {
+	return openWALFrom(cfg, lg, firstRaftIndex, 0)
+}
+
+// openWALFrom 按给定的基线打开日志：baseIndex 是视图第一条的 index，
+// baseTerm 是那个位置上的 term。有快照时两条都来自快照指针（5.1 §7 的启动恢复第 1 步）。
+func openWALFrom(cfg Config, lg *zap.Logger, baseIndex, baseTerm uint64) (*wal, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	log := kvstore.WithComponent(lg, kvstore.ComponentWAL)
-	entries, err := scanWAL(cfg, log)
+	entries, err := scanWALFrom(cfg, log, baseIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -100,8 +111,19 @@ func openWAL(cfg Config, lg *zap.Logger) (*wal, error) {
 		cfg:              cfg,
 		lg:               log,
 		entries:          entries,
+		baseIndex:        baseIndex,
+		baseTerm:         baseTerm,
 		firstIndexByTerm: map[uint64]uint64{},
 		lastIndexByTerm:  map[uint64]uint64{},
+	}
+	if len(entries) > 0 && entries[0].index < baseIndex {
+		// 快照覆盖了日志头部：这些条目不进视图，重启按快照点之后回放（5.1 §7 的启动恢复第 3 步）。
+		// 它们留在盘上，等这一轮压缩删前缀时一起清掉。
+		cut := 0
+		for cut < len(entries) && entries[cut].index < baseIndex {
+			cut++
+		}
+		l.entries = entries[cut:]
 	}
 	l.rebuildTermIndex()
 
@@ -280,6 +302,12 @@ func (l *wal) truncateTo(index uint64) error {
 
 	dropped := len(l.entries) - keep
 	l.entries = l.entries[:keep]
+	if keep == 0 {
+		// 整棵清空之后视图从新的基线起：没有快照时基线是 1，
+		// 有快照时基线不许退到快照之前（5.1 §5）。
+		l.baseIndex = max(index+1, l.baseIndex)
+		l.baseTerm = 0
+	}
 	l.rebuildTermIndex()
 	l.lg.Info("wal suffix dropped",
 		zap.Uint64("kept_through_index", index),
@@ -315,41 +343,47 @@ func (l *wal) resumeAt(seq uint64, size int64) error {
 	return nil
 }
 
-// lastIndex 是日志最后一条的 index，空日志返回 0。
+// lastIndex 是日志最后一条的 index。日志被压缩过而本地暂时为空时，
+// 它是基线减一：那个位置由快照覆盖，投票请求要报的就是这个数（5.1 §5）。
 func (l *wal) lastIndex() uint64 {
 	if len(l.entries) == 0 {
-		return 0
+		return l.baseIndex - 1
 	}
 	return l.entries[len(l.entries)-1].index
 }
 
-// lastTerm 是最后一条的 term，空日志返回 0；投票时比较日志新旧要用（3.1 §7 第 4 步）。
+// lastTerm 是最后一条的 term，空日志时取基线位置上的 term；投票时比较日志新旧要用（3.1 §7 第 4 步）。
 func (l *wal) lastTerm() uint64 {
 	if len(l.entries) == 0 {
-		return 0
+		return l.baseTerm
 	}
 	return l.entries[len(l.entries)-1].term
 }
 
 func (l *wal) length() int { return len(l.entries) }
 
-// entryAt 按 index 取一条。本期没有压缩，日志恒从 1 起，所以 index-1 就是下标。
+// entryAt 按 index 取一条。下标是 index 减去基线：压缩之后日志不再从 1 起，
+// index 小于基线表示这一条已经不在本地日志里（5.1 §5）。
 func (l *wal) entryAt(index uint64) (*walEntry, bool) {
-	if index < firstRaftIndex || int(index) > len(l.entries) {
+	if index < l.baseIndex {
 		return nil, false
 	}
-	return l.entries[index-1], true
+	offset := index - l.baseIndex
+	if offset >= uint64(len(l.entries)) {
+		return nil, false
+	}
+	return l.entries[offset], true
 }
 
 // entriesFrom 取 index 及其之后、最多 limit 条，用于组一次 AppendEntries（3.4 T23.1）。
 func (l *wal) entriesFrom(index uint64, limit int) []*walEntry {
-	if index < firstRaftIndex {
-		index = firstRaftIndex
+	if index < l.baseIndex {
+		index = l.baseIndex
 	}
-	if int(index) > len(l.entries) {
+	if index > l.lastIndex() {
 		return nil
 	}
-	out := l.entries[index-1:]
+	out := l.entries[index-l.baseIndex:]
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
@@ -454,6 +488,12 @@ func createWALSegment(cfg Config, seq uint64) (*os.File, error) {
 // scanWAL 逐文件逐条读回，第一条坏记录起裁剪并停止；它之后的正常记录一并丢弃（2.1 §5 的口径）。
 // index 不连续判 ErrStateMismatch：raft 日志中间有洞就意味着复制逻辑已经错了，裁剪只会把错藏起来。
 func scanWAL(cfg Config, lg *zap.Logger) ([]*walEntry, error) {
+	return scanWALFrom(cfg, lg, firstRaftIndex)
+}
+
+// scanWALFrom 扫回日志条目。expectBase 是视图基线：第一条的 index 不得大于它，
+// 大于就说明日志与快照之间有洞，判 ErrStateMismatch（5.1 §5）。
+func scanWALFrom(cfg Config, lg *zap.Logger, expectBase uint64) ([]*walEntry, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -463,14 +503,21 @@ func scanWAL(cfg Config, lg *zap.Logger) ([]*walEntry, error) {
 	}
 
 	out := make([]*walEntry, 0, 64)
-	next := firstRaftIndex
+	var next uint64
 	for i, seg := range segs {
 		entries, cut, corrupt, err := replayWALSegment(seg, lg)
 		if err != nil {
 			return nil, err
 		}
 		for _, e := range entries {
-			if e.index != next {
+			switch {
+			case next == 0:
+				if e.index > expectBase {
+					return nil, ErrStateMismatchAt(e.index,
+						fmt.Sprintf("wal starts at index %d, past the base index %d", e.index, expectBase))
+				}
+				next = e.index
+			case e.index != next:
 				return nil, ErrStateMismatchAt(e.index,
 					fmt.Sprintf("wal has a hole: index %d follows %d", e.index, next-1))
 			}

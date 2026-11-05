@@ -16,6 +16,11 @@ func (n *Node) appendOnce(peerID string) {
 	if next < firstRaftIndex {
 		next = firstRaftIndex
 	}
+	// 复制游标落到自己日志基线以下：那一段日志已经删掉，改发一份快照（5.1 §7 接收快照）。
+	if next < n.log.baseIndex {
+		n.outbox = append(n.outbox, rpcTask{peerID: peerID, snap: &snapshotTask{index: n.snapshotIndex, term: n.snapshotTerm}})
+		return
+	}
 	req := AppendRequest{
 		Term:         n.term,
 		LeaderID:     n.cfg.NodeID,
@@ -31,6 +36,9 @@ func (n *Node) appendOnce(peerID string) {
 	if req.PrevLogIndex > 0 {
 		if e, ok := n.log.entryAt(req.PrevLogIndex); ok {
 			req.PrevLogTerm = e.term
+		} else if req.PrevLogIndex+1 == n.log.baseIndex {
+			// 这一格已经删掉，它是基线前一格：term 记在基线上（5.1 §5 的基线口径）。
+			req.PrevLogTerm = n.log.baseTerm
 		}
 	}
 	for _, e := range n.log.entriesFrom(next, maxAppendEntries) {
@@ -80,17 +88,21 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 	// 4：一致性检查。prevLogIndex=0 表示从日志头开始，直接过。
 	if req.PrevLogIndex > 0 {
 		prev, ok := n.log.entryAt(req.PrevLogIndex)
-		if !ok {
-			// 本地日志没这么长：conflictTerm 回 null，conflictIndex 取本地长度+1。
-			return n.rejectAppend(nil, n.log.lastIndex()+1, req.ReadRound)
-		}
-		if prev.term != req.PrevLogTerm {
+		switch {
+		case ok && prev.term != req.PrevLogTerm:
 			term := prev.term
 			index, ok := n.log.firstIndexOfTerm(term)
 			if !ok {
 				index = prev.index
 			}
 			return n.rejectAppend(&term, index, req.ReadRound)
+		case !ok:
+			// 本地日志从快照点之后起：那一格在本地日志里查不到，
+			// 但快照点那一格的 term 本地认得，对得上就当它对上（5.1 §5 的基线口径）。
+			if req.PrevLogIndex != n.snapshotIndex || req.PrevLogTerm != n.snapshotTerm {
+				// 本地日志没这么长：conflictTerm 回 null，conflictIndex 取本地长度+1。
+				return n.rejectAppend(nil, n.log.lastIndex()+1, req.ReadRound)
+			}
 		}
 	}
 
@@ -180,12 +192,27 @@ func (n *Node) handleAppendReply(peerID string, req AppendRequest, reply AppendR
 	}
 }
 
+// handleInstallReply 处理一次补发快照的结果：复制游标推到快照点之后，
+// 该成员从此按已复制到快照点计算（5.1 §7 接收快照第 5 步）。
+// 由回执路径在锁内调用。
+func (n *Node) handleInstallReply(peerID string, snapshotIndex uint64) {
+	if n.role != RoleLeader {
+		return
+	}
+	n.nextIndex[peerID] = max(n.nextIndex[peerID], snapshotIndex+1)
+	n.matchIndex[peerID] = max(n.matchIndex[peerID], snapshotIndex)
+	n.advanceCommit()
+	if err := n.applyCommitted(); err != nil {
+		n.logApplyFailure(err)
+	}
+}
+
 // fallbackIndex 按 D20 的三个分支算新的 nextIndex，第二个返回值是 false 表示没有可退的余地：
 // nextIndex 已经在日志头，再发一次还是同一条被拒的请求，留给下一次心跳。
 // 提示值不比原 nextIndex 更小时退一步，回退因此严格递减，一轮重发必然收敛（3.1 §7）。
 func (n *Node) fallbackIndex(peerID string, reply AppendReply) (uint64, bool) {
 	current := n.nextIndex[peerID]
-	if current <= firstRaftIndex {
+	if current <= n.log.baseIndex {
 		return 0, false
 	}
 	fallback := reply.ConflictIndex
@@ -198,7 +225,7 @@ func (n *Node) fallbackIndex(peerID string, reply AppendReply) (uint64, bool) {
 	if fallback >= current {
 		fallback = current - 1
 	}
-	return fallback, fallback >= firstRaftIndex
+	return fallback, fallback >= n.log.baseIndex
 }
 
 // logAppendDenied 的字段口径见 3.1 §10；conflictTerm 是 null 时这个字段整个不出现。

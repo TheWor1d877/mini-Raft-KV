@@ -2,6 +2,7 @@ package kvstore
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -68,6 +69,44 @@ func (k *KV) Apply(key, value string) {
 		KeyField(key),
 		ValueField(value),
 		zap.String("value_fp", valueFingerprint(value)))
+}
+
+// Entry 是状态机里的一条键值，导出与整体替换都用它（5.1 §3）。
+type Entry struct {
+	Key   string
+	Value string
+}
+
+// Snapshot 导出全量键值：快照文件要的就是这份内容（5.1 §7 的生成与提交第 2 步）。
+// 结果按 key 升序，顺序稳定：同一份状态机导出两次得到同样的字节。
+func (k *KV) Snapshot() []Entry {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
+	keys := make([]string, 0, len(k.data))
+	for key := range k.data {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	out := make([]Entry, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, Entry{Key: key, Value: k.data[key]})
+	}
+	return out
+}
+
+// Restore 整体替换状态机：接收对端发来的快照时用（5.1 §7 的接收快照第 3 步）。
+// 替换之后 map 里没有的键读不到；重复 Restore 同一份内容没有副作用。
+func (k *KV) Restore(entries []Entry) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	data := make(map[string]string, len(entries))
+	for _, e := range entries {
+		data[e.Key] = e.Value
+	}
+	k.data = data
 }
 
 func (k *KV) Get(key string) (string, error) {

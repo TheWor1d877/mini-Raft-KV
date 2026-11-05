@@ -31,6 +31,9 @@ type processCluster struct {
 	addr  map[string]string
 	peers string
 	cmd   map[string]*exec.Cmd
+
+	// flags 是给每台机器都追加的启动参数：快照档的开关只在这里能换（5.1 §6）。
+	flags []string
 }
 
 func buildNodeBinary(t *testing.T) string {
@@ -54,12 +57,19 @@ func buildNodeBinary(t *testing.T) string {
 
 func newProcessCluster(t *testing.T, size int) *processCluster {
 	t.Helper()
+	return newProcessClusterFlags(t, size, nil)
+}
+
+// newProcessClusterFlags 起 size 个进程，flags 追加在每台机器的命令行上。
+func newProcessClusterFlags(t *testing.T, size int, flags []string) *processCluster {
+	t.Helper()
 	p := &processCluster{
-		t:    t,
-		bin:  buildNodeBinary(t),
-		root: t.TempDir(),
-		cmd:  map[string]*exec.Cmd{},
-		addr: map[string]string{},
+		flags: flags,
+		t:     t,
+		bin:   buildNodeBinary(t),
+		root:  t.TempDir(),
+		cmd:   map[string]*exec.Cmd{},
+		addr:  map[string]string{},
 	}
 	var items []string
 	for i := 1; i <= size; i++ {
@@ -86,21 +96,29 @@ func newProcessCluster(t *testing.T, size int) *processCluster {
 func (p *processCluster) start() {
 	p.t.Helper()
 	for _, id := range p.ids {
-		dir := filepath.Join(p.root, id)
-		cmd := exec.Command(p.bin,
-			"-node-id", id, "-peers", p.peers, "-data-dir", dir, "-log-level", "debug")
-		// 节点的日志都在数据目录的文件里，stdout 只是兜底：留着管道会让 Cleanup 等不到 EOF。
-		cmd.Stdout = io.Discard
-		cmd.Stderr = io.Discard
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		if err := cmd.Start(); err != nil {
-			p.t.Fatalf("start %s: %v", id, err)
-		}
-		p.cmd[id] = cmd
+		p.startOne(id)
 	}
-	for _, id := range p.ids {
-		p.waitReady(id)
+}
+
+// startOne 只起一台并等它就维：被 kill9 停下的节点按同一份数据目录重起来走的就是这条路。
+func (p *processCluster) startOne(id string) {
+	p.t.Helper()
+	if c := p.cmd[id]; c != nil && c.ProcessState == nil {
+		p.t.Fatalf("node %s is already running in this fixture", id)
 	}
+	dir := filepath.Join(p.root, id)
+	args := []string{"-node-id", id, "-peers", p.peers, "-data-dir", dir, "-log-level", "debug"}
+	args = append(args, p.flags...)
+	cmd := exec.Command(p.bin, args...)
+	// 节点的日志都在数据目录的文件里，stdout 只是兜底：留着管道会让 Cleanup 等不到 EOF。
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		p.t.Fatalf("start %s: %v", id, err)
+	}
+	p.cmd[id] = cmd
+	p.waitReady(id)
 }
 
 func (p *processCluster) url(id, path string) string {
@@ -200,10 +218,12 @@ func (p *processCluster) kill9(id string) {
 	if err := cmd.Process.Kill(); err != nil {
 		p.t.Fatalf("kill -9 %s: %v", id, err)
 	}
-	_, err := cmd.Process.Wait()
+	state, err := cmd.Process.Wait()
 	if err != nil {
 		p.t.Errorf("reap %s: %v", id, err)
 	}
+	// ProcessState 要落到 cmd 上：写入侧与重起侧都据此判这台还在不在。
+	cmd.ProcessState = state
 }
 
 // stopAll 发 SIGTERM 并等每个进程自己退出；退出码来自真进程，不是夹具推断的。
@@ -233,6 +253,78 @@ func (p *processCluster) stopAll() map[string]int {
 		delete(p.cmd, id)
 	}
 	return codes
+}
+
+// logPath 是这台进程写日志的文件：补发快照有没有落到它头上，读的就是这份原文。
+func (p *processCluster) logPath(id string) string {
+	return filepath.Join(p.root, id, "log", NodeLogFileName)
+}
+
+// postRaw 发一次请求体是原始字节的 POST：补发快照那条路径不带 JSON（D32）。
+func (p *processCluster) postRaw(id, path, body string) (int, []byte, error) {
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).
+		Post(p.url(id, path), "application/octet-stream", strings.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, raw, err
+}
+
+// walFirstIndex 读盘上 raft 日志的第一条 index，也就是这台机器此刻的日志基线。
+// 日志被删空时没有帧可读，回 0。
+func (p *processCluster) walFirstIndex(id string) uint64 {
+	p.t.Helper()
+	paths, err := filepath.Glob(filepath.Join(p.root, id, RaftDirName, WALDirName, "*.wal"))
+	if err != nil {
+		p.t.Fatalf("glob the wal of %s: %v", id, err)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			p.t.Fatalf("read %s: %v", path, err)
+		}
+		if len(raw) < kvstore.FrameHeaderSize {
+			continue
+		}
+		size, checksum, err := kvstore.DecodeFrame(raw[:kvstore.FrameHeaderSize], 0)
+		if err != nil {
+			p.t.Fatalf("frame header at the head of %s: %v", path, err)
+		}
+		end := kvstore.FrameHeaderSize + int(size)
+		if end > len(raw) {
+			continue
+		}
+		payload := raw[kvstore.FrameHeaderSize:end]
+		if err := kvstore.CheckFrame(size, checksum, payload, 0); err != nil {
+			p.t.Fatalf("first frame of %s is corrupt: %v", path, err)
+		}
+		_, index, _, err := decodeWALRecord(payload, 0)
+		if err != nil {
+			p.t.Fatalf("decode the first record of %s: %v", path, err)
+		}
+		return index
+	}
+	return 0
+}
+
+// diskSnapshotIndex 读盘上的元数据指针，取 snapshotIndex；没有指针文件就是 0。
+func (p *processCluster) diskSnapshotIndex(id string) uint64 {
+	p.t.Helper()
+	raw, err := os.ReadFile(filepath.Join(p.root, id, RaftDirName, SnapshotDirName, SnapshotPointerName))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		p.t.Fatalf("read the snapshot pointer of %s: %v", id, err)
+	}
+	var pointer snapshotPointer
+	if err := json.Unmarshal(raw, &pointer); err != nil {
+		p.t.Fatalf("snapshot pointer of %s: %v: %s", id, err, raw)
+	}
+	return pointer.SnapshotIndex
 }
 
 // readExitCode 跑一个注定起不来的进程并取它的退出码：stderr 一并留着，那是 3.1 §4 说的
@@ -364,6 +456,91 @@ func TestKillLeaderReElectsAndKeepsTheValue(t *testing.T) {
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
+	}
+}
+
+// 一台节点被停到 Leader 删掉日志前缀，重新起来后 Leader 给它补发一份快照，
+// 它把状态机补齐并读得到快照点之后的所有写，两台的日志基线落在同一格（5.1 §7 接收快照、5.2 §3 的进程行）。
+func TestStoppedMemberCatchesUpWithAnInstalledSnapshot(t *testing.T) {
+	if testing.Short() {
+		t.Skip("进程用例要起 5 个真进程，-short 下跳过")
+	}
+	// 落后一条就豁免：停掉的那台卡不住删除边界。
+	p := newProcessClusterFlags(t, 5, []string{"-snapshot-exempt-entries", "1"})
+
+	leader, _ := p.writeThrough("warm", "v0")
+	victim := ""
+	for _, id := range p.ids {
+		if id != leader {
+			victim = id
+			break
+		}
+	}
+	p.kill9(victim)
+
+	before := []string{"warm", "k1", "k2", "k3"}
+	for _, key := range before[1:] {
+		p.writeThrough(key, "v-"+key)
+	}
+
+	status, raw, err := p.postRaw(leader, "/raft/snapshot", "")
+	if err != nil {
+		t.Fatalf("trigger a snapshot on %s: %v", leader, err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("snapshot on the leader = %d: %s", status, firstBytes(raw, 200))
+	}
+	var reply map[string]any
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		t.Fatalf("snapshot reply is not one JSON object: %s", firstBytes(raw, 200))
+	}
+	snapIndex := toFloat(reply["snapshot_index"])
+	if snapIndex < 1 || reply["ok"] != true {
+		t.Fatalf("snapshot reply = %v, want ok with a snapshot index", reply)
+	}
+	if got := p.diskSnapshotIndex(leader); uint64(snapIndex) != got {
+		t.Fatalf("the reply says %v but the pointer on disk says %d", reply["snapshot_index"], got)
+	}
+
+	// 快照点之后的写：补发之后还得靠日志把这两条补上。
+	after := []string{"k4", "k5"}
+	for _, key := range after {
+		p.writeThrough(key, "v-"+key)
+	}
+	if got := p.walFirstIndex(leader); got != uint64(snapIndex)+1 {
+		t.Fatalf("the leader log starts at %d, want the snapshot point %d plus one", got, uint64(snapIndex))
+	}
+
+	p.startOne(victim)
+
+	written := map[string]string{"warm": "v0"}
+	for _, key := range append(before[1:], after...) {
+		written[key] = "v-" + key
+	}
+	for key, want := range written {
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			status, raw, err := p.get(victim, key)
+			if err == nil && status == http.StatusOK && strings.Contains(string(raw), `"value":"`+want+`"`) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s never read back %s after the catch-up (last %d %s, err %v): %s",
+					victim, key, status, firstBytes(raw, 120), err, p.logTail(victim, 10))
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	if !fileContains(p.logPath(victim), "snapshot installed") {
+		t.Fatalf("%s never logged snapshot installed: %s", victim, p.logTail(victim, 15))
+	}
+	if got := p.diskSnapshotIndex(victim); uint64(snapIndex) != got {
+		t.Fatalf("the installed member points at %d, want the leader's snapshot index %d", got, uint64(snapIndex))
+	}
+	if got := p.walFirstIndex(victim); got != uint64(snapIndex)+1 {
+		t.Fatalf("the installed member log starts at %d, want the same baseline as the leader (%d)",
+			got, uint64(snapIndex)+1)
 	}
 }
 

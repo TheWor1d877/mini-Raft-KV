@@ -848,3 +848,176 @@ func TestRaftLogDisabledLogFields(t *testing.T) {
 		t.Error("the disabled event carries no error field")
 	}
 }
+
+// 视图的基线初值是 1：没有快照时日志从 index 1 起。
+func TestWalViewBaseIndexStartsAtOne(t *testing.T) {
+	l := openTestRaftLog(t, testConfig(t))
+	if l.baseIndex != 1 {
+		t.Fatalf("baseIndex = %d, want 1", l.baseIndex)
+	}
+	if l.baseTerm != 0 {
+		t.Fatalf("baseTerm = %d, want 0", l.baseTerm)
+	}
+}
+
+// entryAt 按 index - baseIndex 取下标，index 小于基线时取不到。
+func TestEntryAtIndexesRelativeToTheBaseline(t *testing.T) {
+	cfg := testConfig(t)
+	l := openTestRaftLog(t, cfg)
+	for i := uint64(1); i <= 5; i++ {
+		mustAppend(t, l, 1, i, "payload")
+	}
+	if e, ok := l.entryAt(3); !ok || e.index != 3 {
+		t.Fatalf("entryAt(3) = %+v %v, want the entry at index 3", e, ok)
+	}
+	if err := l.dropPrefix(4); err != nil {
+		t.Fatalf("drop prefix: %v", err)
+	}
+	if l.baseIndex != 4 {
+		t.Fatalf("baseIndex = %d, want 4", l.baseIndex)
+	}
+	if e, ok := l.entryAt(4); !ok || e.index != 4 {
+		t.Fatalf("entryAt(4) = %+v %v, want the entry at index 4", e, ok)
+	}
+	if _, ok := l.entryAt(3); ok {
+		t.Fatal("entryAt(3) answered below the baseline")
+	}
+}
+
+// 基线前一格的 term 就是组 AppendEntries 时的 prevLogTerm：dropPrefix 把它留在视图上。
+func TestDropPrefixKeepsTheTermOfTheSlotBeforeTheBaseline(t *testing.T) {
+	l := openTestRaftLog(t, testConfig(t))
+	mustAppend(t, l, 1, 1, "a")
+	mustAppend(t, l, 1, 2, "b")
+	mustAppend(t, l, 2, 3, "c")
+	mustAppend(t, l, 2, 4, "d")
+	if err := l.dropPrefix(4); err != nil {
+		t.Fatalf("drop prefix: %v", err)
+	}
+	if l.baseIndex != 4 {
+		t.Fatalf("baseIndex = %d, want 4", l.baseIndex)
+	}
+	if l.baseTerm != 2 {
+		t.Fatalf("baseTerm = %d, want the term of index 3", l.baseTerm)
+	}
+	if got := l.lastTerm(); got != 2 {
+		t.Fatalf("lastTerm with entries = %d, want 2", got)
+	}
+}
+
+// 日志被删空时基线前一格不在本地日志里：认得就留 term，认不出留 0（5.1 §5）。
+func TestClearPrefixBaselinesTheTermItCanSee(t *testing.T) {
+	t.Run("the slot before the baseline is in the dropped prefix", func(t *testing.T) {
+		l := openTestRaftLog(t, testConfig(t))
+		mustAppend(t, l, 1, 1, "a")
+		mustAppend(t, l, 3, 2, "b")
+		if err := l.dropPrefix(3); err != nil {
+			t.Fatalf("drop prefix: %v", err)
+		}
+		if l.length() != 0 {
+			t.Fatalf("entries in view = %d, want the log cleared", l.length())
+		}
+		if l.baseIndex != 3 {
+			t.Fatalf("baseIndex = %d, want 3", l.baseIndex)
+		}
+		if l.baseTerm != 3 {
+			t.Fatalf("baseTerm = %d, want the term of index 2", l.baseTerm)
+		}
+		if got := l.lastTerm(); got != 3 {
+			t.Fatalf("lastTerm on an empty view = %d, want the baseline term", got)
+		}
+	})
+
+	t.Run("the dropped prefix does not reach the slot", func(t *testing.T) {
+		l := openTestRaftLog(t, testConfig(t))
+		mustAppend(t, l, 1, 1, "a")
+		mustAppend(t, l, 1, 2, "b")
+		// 基线跳到 5：index 4 那一条本地从来没有过，term 无从可考。
+		if err := l.dropPrefix(5); err != nil {
+			t.Fatalf("drop prefix: %v", err)
+		}
+		if l.baseIndex != 5 {
+			t.Fatalf("baseIndex = %d, want 5", l.baseIndex)
+		}
+		if l.baseTerm != 0 {
+			t.Fatalf("baseTerm = %d, want 0 for a slot the log never held", l.baseTerm)
+		}
+	})
+}
+
+// 有快照时的恢复扫描：日志第一条晚于 snapshotIndex+1 判洞，快照覆盖的残留条目跳过。
+func TestScanRaftLogWithASnapshotBase(t *testing.T) {
+	t.Run("first entry past the base is a hole", func(t *testing.T) {
+		cfg := testConfig(t)
+		data := append(raftFrame(t, 1, 5, "e"), raftFrame(t, 1, 6, "f")...)
+		plantRaftSegment(t, cfg, 1, data)
+
+		_, err := scanWALFrom(cfg, zap.NewNop(), 4)
+		if !errors.Is(err, ErrStateMismatch) {
+			t.Fatalf("scan past the base = %v, want ErrStateMismatch", err)
+		}
+	})
+
+	t.Run("entries covered by the snapshot are skipped", func(t *testing.T) {
+		cfg := testConfig(t)
+		data := append(raftFrame(t, 1, 2, "b"), raftFrame(t, 1, 3, "c")...)
+		data = append(data, raftFrame(t, 1, 4, "d")...)
+		plantRaftSegment(t, cfg, 1, data)
+
+		entries, err := scanWALFrom(cfg, zap.NewNop(), 4)
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if len(entries) != 3 {
+			t.Fatalf("scanned entries = %d, want 3", len(entries))
+		}
+		if entries[0].index != 2 {
+			t.Fatalf("the first scanned index = %d, want 2", entries[0].index)
+		}
+
+		// 视图的基线落在 snapshotIndex+1，被覆盖的那两条不进视图。
+		l, err := openWALFrom(cfg, zap.NewNop(), 4, 1)
+		if err != nil {
+			t.Fatalf("open wal from the snapshot base: %v", err)
+		}
+		t.Cleanup(func() { _ = l.close() })
+		if l.baseIndex != 4 {
+			t.Fatalf("baseIndex = %d, want 4", l.baseIndex)
+		}
+		if l.length() != 1 {
+			t.Fatalf("entries in view = %d, want 1", l.length())
+		}
+		if _, ok := l.entryAt(3); ok {
+			t.Fatal("an entry covered by the snapshot is still in view")
+		}
+	})
+}
+
+// 没有快照时第一条必须是 1。
+func TestScanRaftLogWithoutASnapshotStartsAtOne(t *testing.T) {
+	cfg := testConfig(t)
+	plantRaftSegment(t, cfg, 1, raftFrame(t, 1, 2, "b"))
+
+	_, err := scanWALFrom(cfg, zap.NewNop(), 1)
+	if !errors.Is(err, ErrStateMismatch) {
+		t.Fatalf("scan without a snapshot = %v, want ErrStateMismatch", err)
+	}
+}
+
+// dropPrefix 之后 entriesFrom 只给基线之后的条目。
+func TestEntriesFromAfterDropPrefix(t *testing.T) {
+	l := openTestRaftLog(t, testConfig(t))
+	for i := uint64(1); i <= 5; i++ {
+		mustAppend(t, l, 1, i, "payload")
+	}
+	if err := l.dropPrefix(3); err != nil {
+		t.Fatalf("drop prefix: %v", err)
+	}
+	got := l.entriesFrom(1, 0)
+	if len(got) != 3 {
+		t.Fatalf("entriesFrom(1) = %d entries, want the 3 after the baseline", len(got))
+	}
+	if got[0].index != 3 {
+		t.Fatalf("the first entry = %d, want 3", got[0].index)
+	}
+}

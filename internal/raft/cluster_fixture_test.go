@@ -91,6 +91,20 @@ func (s *stubTransport) AppendEntries(to string, req AppendRequest) (AppendReply
 	return peer.handleAppendEntries(req), nil
 }
 
+// InstallSnapshot 补发一份快照：走的是对端节点的同一个处理函数（5.1 §4）。
+func (s *stubTransport) InstallSnapshot(to string, index, term uint64, body []byte) error {
+	s.c.sent = append(s.c.sent, sentRPC{from: s.id, to: s.c.idOf(to), kind: "install"})
+	if s.c.blocked[s.id][to] {
+		return errFixtureDown
+	}
+	peer, ok := s.c.running(s.c.idOf(to))
+	if !ok {
+		return errFixtureGone
+	}
+	_, err := peer.handleInstallSnapshot(index, term, body)
+	return err
+}
+
 // cluster 是 N 个真节点的夹具：每个节点各自一份数据目录、一份 kvstore.KV 和一个 Node，
 // 三份配置按 id 存着，重启用的还是同一份数据目录（3.2 §3 夹具行）。
 type cluster struct {

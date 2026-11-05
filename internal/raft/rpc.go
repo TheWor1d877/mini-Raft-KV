@@ -19,10 +19,12 @@ import (
 
 // 四条路径共用一个端口：客户端与 RPC 打在同一个监听地址上（3.1 §4、D11）。
 const (
-	routeRequestVote   = "/raft/request-vote"
-	routeAppendEntries = "/raft/append-entries"
-	routePut           = "/put"
-	routeGet           = "/get"
+	routeRequestVote     = "/raft/request-vote"
+	routeAppendEntries   = "/raft/append-entries"
+	routeSnapshot        = "/raft/snapshot"
+	routeInstallSnapshot = "/raft/install-snapshot"
+	routePut             = "/put"
+	routeGet             = "/get"
 
 	// 一轮 AppendEntries 最多 64 条、每条命令的上限是 2.1 的 MaxEntrySize，
 	// 请求体的天花板按这两个值相乘再留一帧的余量；回执是小对象。
@@ -31,6 +33,10 @@ const (
 
 	// 对端非 200 时只读这么多个字节进错误文本：那是给人看的线索，不是载荷。
 	maxErrorBodyBytes = 512
+
+	// 补发快照的请求体是快照文件的原始字节，它比一批 AppendEntries 大得多，
+	// 上限按单条 entry 的四倍给：状态机的键值条数与日志条数同量级。
+	maxSnapshotBodyBytes = int64(64 * kvstore.MaxEntrySize)
 )
 
 // httpTransport 是 Transport 的真实现：一条 RPC 一个 POST，JSON 编解码（D18）。
@@ -63,6 +69,35 @@ func (t *httpTransport) AppendEntries(to string, req AppendRequest) (AppendReply
 		return AppendReply{}, err
 	}
 	return reply, nil
+}
+
+// InstallSnapshot 补发一份快照：请求体是快照文件的原始字节，index 与 term 走 query（D32）。
+func (t *httpTransport) InstallSnapshot(to string, index, term uint64, body []byte) error {
+	url := fmt.Sprintf("http://%s%s?index=%d&term=%d", to, routeInstallSnapshot, index, term)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return kvstore.ErrIOFrom("build "+routeInstallSnapshot+" request", 0, err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return kvstore.ErrIOFrom("send "+routeInstallSnapshot+" to "+to, 0, err)
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxReplyBodyBytes))
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		return fmt.Errorf("%s on %s answered %d: %s: %w",
+			routeInstallSnapshot, to, resp.StatusCode, bytes.TrimSpace(detail), kvstore.ErrIO)
+	}
+	var reply InstallSnapshotReply
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReplyBodyBytes)).Decode(&reply); err != nil {
+		return kvstore.ErrIOFrom("decode "+routeInstallSnapshot+" reply from "+to, 0, err)
+	}
+	return nil
 }
 
 // post 发一条 RPC。连不上、超时、状态码不是 200 都只回一个错误，
@@ -128,13 +163,17 @@ func (h *nodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleVote(w, r, reqID, start)
 	case r.URL.Path == routeAppendEntries && r.Method == http.MethodPost:
 		h.handleAppend(w, r, reqID, start)
+	case r.URL.Path == routeSnapshot && r.Method == http.MethodPost:
+		h.handleSnapshot(w, r, reqID, start)
+	case r.URL.Path == routeInstallSnapshot && r.Method == http.MethodPost:
+		h.handleInstallSnapshot(w, r, reqID, start)
 	case r.URL.Path == routePut && r.Method == http.MethodPost:
 		h.handlePut(w, r, reqID, start)
 	case r.URL.Path == routeGet && r.Method == http.MethodGet:
 		h.handleGet(w, r, reqID, start)
 	case h.isKnownRoute(r.URL.Path):
 		h.fail(w, r.URL.Path, reqID, http.StatusMethodNotAllowed,
-			"method_not_allowed", "routes are POST /raft/request-vote, POST /raft/append-entries, POST /put and GET /get", 0, start)
+			"method_not_allowed", "routes are POST /raft/request-vote, POST /raft/append-entries, POST /raft/snapshot, POST /raft/install-snapshot, POST /put and GET /get", 0, start)
 	default:
 		h.fail(w, r.URL.Path, reqID, http.StatusNotFound,
 			"not_found", "unknown route", 0, start)
@@ -143,7 +182,7 @@ func (h *nodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *nodeHandler) isKnownRoute(path string) bool {
 	switch path {
-	case routeRequestVote, routeAppendEntries, routePut, routeGet:
+	case routeRequestVote, routeAppendEntries, routeSnapshot, routeInstallSnapshot, routePut, routeGet:
 		return true
 	default:
 		return false
@@ -168,6 +207,74 @@ func (h *nodeHandler) handleAppend(w http.ResponseWriter, r *http.Request, reqID
 		return
 	}
 	h.reply(w, routeAppendEntries, reqID, h.n.handleAppendEntries(req), start)
+}
+
+// snapshotResponse 是手动触发快照的回执（5.1 §4 的形状表）。
+type snapshotResponse struct {
+	OK            bool   `json:"ok"`
+	SnapshotIndex uint64 `json:"snapshot_index"`
+	Entries       int    `json:"entries"`
+}
+
+// handleSnapshot 手动触发一次快照：非 Leader 回 503，快照点选不出来回 409。
+// 回执里的条数读的是刚提交的元数据指针：那个数是快照文件的属性，不在 Node 上留副本。
+func (h *nodeHandler) handleSnapshot(w http.ResponseWriter, r *http.Request, reqID string, start time.Time) {
+	index, err := h.n.TriggerSnapshot()
+	if err != nil {
+		if errors.Is(err, ErrNotLeader) {
+			h.notLeader(w, routeSnapshot, reqID, err, start)
+			return
+		}
+		h.failWithError(w, routeSnapshot, reqID, err, start)
+		return
+	}
+	pointer, err := h.n.snap.readPointer()
+	if err != nil {
+		h.failWithError(w, routeSnapshot, reqID, err, start)
+		return
+	}
+	h.ok(w, routeSnapshot, reqID, snapshotResponse{OK: true, SnapshotIndex: index, Entries: pointer.Entries}, start)
+}
+
+// handleInstallSnapshot 接收对端补发的快照：请求体是快照文件的原始字节，
+// index 与 term 走 query，缺一个就是 400（5.1 §4 的形状表）。
+func (h *nodeHandler) handleInstallSnapshot(w http.ResponseWriter, r *http.Request, reqID string, start time.Time) {
+	query := r.URL.Query()
+	if !query.Has("index") || !query.Has("term") {
+		h.fail(w, routeInstallSnapshot, reqID, http.StatusBadRequest,
+			"bad_request", "query parameters index and term are required", 0, start)
+		return
+	}
+	index, err := strconv.ParseUint(query.Get("index"), 10, 64)
+	if err != nil {
+		h.fail(w, routeInstallSnapshot, reqID, http.StatusBadRequest,
+			"bad_request", "query parameter index is not a number", 0, start)
+		return
+	}
+	term, err := strconv.ParseUint(query.Get("term"), 10, 64)
+	if err != nil {
+		h.fail(w, routeInstallSnapshot, reqID, http.StatusBadRequest,
+			"bad_request", "query parameter term is not a number", 0, start)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxSnapshotBodyBytes))
+	if err != nil {
+		var over *http.MaxBytesError
+		if errors.As(err, &over) {
+			h.fail(w, routeInstallSnapshot, reqID, http.StatusRequestEntityTooLarge,
+				"too_large", "snapshot body over the limit", 0, start)
+			return
+		}
+		h.fail(w, routeInstallSnapshot, reqID, http.StatusBadRequest,
+			"bad_request", err.Error(), 0, start)
+		return
+	}
+	reply, err := h.n.handleInstallSnapshot(index, term, body)
+	if err != nil {
+		h.failWithError(w, routeInstallSnapshot, reqID, err, start)
+		return
+	}
+	h.ok(w, routeInstallSnapshot, reqID, reply, start)
 }
 
 type putRequest struct {

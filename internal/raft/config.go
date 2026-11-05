@@ -31,10 +31,23 @@ const (
 	DefaultClockDriftMS  = int64(50)
 	DefaultReadTimeoutMS = int64(1000)
 
+	// 快照与压缩四个开关的默认值（5.1 §6）。
+	DefaultSnapshotEntries       = uint64(1000)
+	DefaultSnapshotBytes         = int64(64 << 20)
+	DefaultSnapshotMinIntervalMS = int64(60000)
+	DefaultSnapshotExemptEntries = uint64(1000)
+
 	RaftDirName      = "raft"
 	WALDirName       = "wal"
 	StateFileName    = "state"
 	StateTmpFileName = "state.tmp"
+	SnapshotDirName  = "snapshot"
+
+	// 快照文件与元数据指针的命名（5.1 §6）。
+	SnapshotFileFormat     = "%08d.snap"
+	SnapshotTmpFileFormat  = "%08d.snap.tmp"
+	SnapshotPointerName    = "current.json"
+	SnapshotPointerTmpName = "current.json.tmp"
 
 	WALFileFormat    = "%08d.wal"
 	WALTmpFileFormat = "%08d.wal.tmp"
@@ -78,6 +91,13 @@ type Config struct {
 	ReadMode      ReadMode
 	ClockDriftMS  int64
 	ReadTimeoutMS int64
+
+	// 快照与压缩的四个参数（5.1 §6）：前两个是触发阈值，后两个管删除边界与豁免。
+	// 两个阈值都为 0 时自动触发全关，手动入口任何时候可调。
+	SnapshotEntries       uint64
+	SnapshotBytes         int64
+	SnapshotMinIntervalMS int64
+	SnapshotExemptEntries uint64
 }
 
 func DefaultConfig() Config {
@@ -91,6 +111,11 @@ func DefaultConfig() Config {
 		ReadMode:          DefaultReadMode,
 		ClockDriftMS:      DefaultClockDriftMS,
 		ReadTimeoutMS:     DefaultReadTimeoutMS,
+
+		SnapshotEntries:       DefaultSnapshotEntries,
+		SnapshotBytes:         DefaultSnapshotBytes,
+		SnapshotMinIntervalMS: DefaultSnapshotMinIntervalMS,
+		SnapshotExemptEntries: DefaultSnapshotExemptEntries,
 	}
 }
 
@@ -127,6 +152,25 @@ func (c Config) WALPath(seq uint64) string {
 
 func (c Config) WALTmpPath(seq uint64) string {
 	return filepath.Join(c.WALDir(), fmt.Sprintf(WALTmpFileFormat, seq))
+}
+
+// 快照目录与两个路径（5.1 §6）：快照文件带 index，元数据指针固定一个名字。
+func (c Config) SnapshotDir() string { return filepath.Join(c.RaftDir(), SnapshotDirName) }
+
+func (c Config) SnapshotPath(index uint64) string {
+	return filepath.Join(c.SnapshotDir(), fmt.Sprintf(SnapshotFileFormat, index))
+}
+
+func (c Config) SnapshotTmpPath(index uint64) string {
+	return filepath.Join(c.SnapshotDir(), fmt.Sprintf(SnapshotTmpFileFormat, index))
+}
+
+func (c Config) SnapshotPointerPath() string {
+	return filepath.Join(c.SnapshotDir(), SnapshotPointerName)
+}
+
+func (c Config) SnapshotPointerTmpPath() string {
+	return filepath.Join(c.SnapshotDir(), SnapshotPointerTmpName)
 }
 
 // LogDir 与 NodeLogPath 走的是 2.1 的目录布局：日志跟 wal、raft 平级，都在数据目录里。
@@ -183,6 +227,12 @@ func (c Config) Validate() error {
 	if c.ReadTimeoutMS <= 0 {
 		return fmt.Errorf("read timeout %dms must be positive", c.ReadTimeoutMS)
 	}
+	if c.SnapshotBytes < 0 {
+		return fmt.Errorf("snapshot bytes %d must not be negative", c.SnapshotBytes)
+	}
+	if c.SnapshotMinIntervalMS < 0 {
+		return fmt.Errorf("snapshot min interval %dms must not be negative", c.SnapshotMinIntervalMS)
+	}
 	// 一轮广播的最坏耗时是 (N-1) 次串行 RPC（4.1 §6、D23）。
 	broadcastMS := int64(len(c.Peers)-1) * c.rpcTimeout().Milliseconds()
 	switch c.ReadMode {
@@ -202,7 +252,7 @@ func (c Config) Validate() error {
 
 // 建目录用 0755，与 kvstore 的 lockAndPrepare 一致（2.1 §6）。
 func (c Config) ensureDirs() error {
-	for _, dir := range []string{c.DataDir, c.RaftDir(), c.WALDir()} {
+	for _, dir := range []string{c.DataDir, c.RaftDir(), c.WALDir(), c.SnapshotDir()} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return kvstore.ErrIOFrom("create raft dir", 0, err)
 		}
@@ -253,6 +303,10 @@ func load(name string, args []string, memberTable bool) (Config, kvstore.Config,
 	fs.StringVar(&readMode, "read-mode", string(cfg.ReadMode), "linearizable read path: lease or readindex")
 	fs.Int64Var(&cfg.ClockDriftMS, "clock-drift-ms", cfg.ClockDriftMS, "clock drift margin taken off the lease window")
 	fs.Int64Var(&cfg.ReadTimeoutMS, "read-timeout-ms", cfg.ReadTimeoutMS, "upper bound of one linearizable read")
+	fs.Uint64Var(&cfg.SnapshotEntries, "snapshot-entries", cfg.SnapshotEntries, "log entries after the last snapshot that trigger one snapshot")
+	fs.Int64Var(&cfg.SnapshotBytes, "snapshot-bytes", cfg.SnapshotBytes, "log directory size that triggers one snapshot")
+	fs.Int64Var(&cfg.SnapshotMinIntervalMS, "snapshot-min-interval-ms", cfg.SnapshotMinIntervalMS, "minimum interval between two snapshots")
+	fs.Uint64Var(&cfg.SnapshotExemptEntries, "snapshot-exempt-entries", cfg.SnapshotExemptEntries, "lag entries behind which a member is exempt from the safe index")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, kvstore.Config{}, err
 	}
