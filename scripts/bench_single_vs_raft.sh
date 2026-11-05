@@ -2,12 +2,11 @@
 # 单节点集群与 5 节点集群的写吞吐对照：同一份负载打三档，D19（每条 Sync）与单机开销的差值从这里算。
 # 用法：scripts/bench_single_vs_raft.sh [写入条数=2000] [起始端口=8901] [数据根目录=data/bench]
 # 三档：single-node-fsync 单进程 miniraft-kv，即单节点 raft 集群：成员表只有自己，
-#                       等满一个选举截止自票当选，写路径每条一次 Sync（docs/8 §二）
-#       raft-fsync        5 进程 miniraft-node，每条 raft 日志 Sync
-#       raft-nofsync      同上但 -raft-fsync=false：只跳过 raft 日志的 Sync
-# 档位名从 kv-batch64 改成 single-node-fsync：KV WAL 与「每 64 条一次 Sync」随合并一起取消，
-# 档 1 现在跑的是 raft 的写路径，读数背上 raft 的帧头（8 字节帧头 + op/term/index），与旧口径不同。
-# D21 的旧基线数字已经作废，合并后要在这三档上重跑，本脚本不再抄一份数字进来。
+#                       等满一个选举截止自票当选，写路径每条一次 Sync（docs/8 §三）
+#       raft-fsync        5 进程 miniraft-node，每条日志 Sync
+#       raft-nofsync      同上但 -raft-fsync=false：只跳过日志的 Sync
+# 档 1 跑的是 raft 的写路径，一帧的字节数是 8 字节帧头 + op/term/index 17B + command（3.1 §5）。
+# D21 的对照读数在三档上重跑，本脚本不抄数字进来。
 # 口径：单客户端、串行写、一条一个 HTTP 请求、复用同一条连接（curl 每请求起进程的话，
 #       进程开销会盖掉 fsync 的差，对照就不成立了）。
 # 每档用全新的数据目录，互不继承；stdout 每档一行 mode writes acked elapsed_ms ops_per_sec p50_ms p99_ms。
@@ -16,7 +15,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# 目录名与扩展名各收在这里：一份日志只有这一处口径（docs/8 §二）。
+# 目录名与扩展名各收在这里：一份日志只有这一处口径（docs/8 §一）。
 SEG_DIR_REL="raft/wal"
 SEG_EXT="wal"
 # 进程日志与 stderr 的落点只有这一处口径（3.1 §6 末段：一个进程一份 miniraft-node.log）。
@@ -94,7 +93,7 @@ wait_ready() { # $1 = addr，$2 = 数据目录，$3 = 日志相对路径
 }
 
 # 等本节点真的当上 Leader：成员表只有自己时多数派是 1，但进程起来先停在 Follower，
-# 要等满一个选举截止（[T,2T) = 500~1000ms）才自票当选（docs/8 §二）。
+# 要等满一个选举截止（[T,2T) = 500~1000ms）才自票当选（docs/8 §三）。
 # 判据用缺省档的 /get：Follower 一律 503，Leader 上这个 key 不存在是 404（D24）。
 # 不等这一条，客户端头几百个请求会成串拿 503，档位对照就变成在测选举窗口。
 wait_leader() { # $1 = addr
@@ -193,8 +192,7 @@ report() { # $1 = mode，$2 = json，$3 = 这一档 Leader 的 WAL 字节
 }
 
 # 这一档的日志落了多少字节：段目录里没有 *.$SEG_EXT 就是没落盘，算跑失败。
-# KV WAL 与它的批次开关（-batch-size、-fsync）随合并一起取消，wal_bytes 从此只有一栏：
-# 合并后的日志就是 raft/wal，旧口径里 wal_bytes（KV WAL）与 raftlog_bytes（raft 日志）两栏并成一栏。
+# wal_bytes 只有一栏：一份日志就是 raft/wal，写路径不再有第二份要计的落盘对象。
 seg_bytes() { # $1 = 节点数据目录
 	local dir="$1" n
 	n="$(find "$dir/$SEG_DIR_REL" -name "*.$SEG_EXT" 2>/dev/null | wc -l | tr -d ' ')"

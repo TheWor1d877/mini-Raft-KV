@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # 崩溃注入：起单节点集群 → 写 N 条 → 在第 K 条之后 kill -9 → 重启 → 对账。
-# 进程载体仍是 bin/miniraft-kv，但它现在是单节点 raft 集群（docs/8 §二）：
-# 成员表只有自己，起来先停在 Follower，等满一个选举截止自票当选，
+# 进程载体是 bin/miniraft-kv：成员表只有自己的单节点 raft 集群（docs/8 §三），
+# 起来先停在 Follower，等满一个选举截止自票当选，
 # 当选那一轮在日志尾部追加一条 no-op（3.1 §4），所以第一条客户端写落在 index 2。
 # 用法：先 go build -o bin/miniraft-kv ./cmd/miniraft-kv
 #       scripts/crash_inject.sh [写入条数=2000] [第几条后杀=全写完] [raft-fsync=true|false] [段上限=默认]
 # KEEP=1 保留数据目录并在最后打印路径（默认随退出删掉）。
 #
-# 输出列名与列序沿用旧版，第一格的含义变了：KV WAL 取消后 -batch-size 这个开关没了，
-# 那一格改成装 -raft-fsync 的取值（true/false）。
-#   batch         本次跑的 -raft-fsync（旧口径是 KV 的批次 64）
+#   fsync         本次跑的 -raft-fsync 取值（true/false）
 #   acked         客户端拿到 200 的写条数
 #   durable       重启后从日志里恢复出来的条目数（取数见下）
 #   not_durable   acked - durable；写路径每条一次 Sync 时必须等于 0
@@ -26,11 +24,12 @@
 # 只数 component=kv 的 "entry applied"（raft 侧那条同名的行对每个 index 都打，含 no-op）。
 # 两者相加就是日志恢复出的写条数，与 acked 同量纲，not_durable 才等于「没落盘的确认写」。
 #
-# 持久性边界：Leader 每条一次 Sync（-raft-fsync=true），所以 kill -9 之后已确认的写一条都不该丢，
-# D6 那个「丢写落在 0..batch-1 批次窗口里」的口径随 KV WAL 一起作废。
-# -raft-fsync=false 时 Sync 整条跳过，只报数不断言丢写。
+# 持久性边界：Leader 每条一次 Sync（-raft-fsync=true），kill -9 之后已确认的写一条都不丢，
+# 断言按 not_durable=0 且 lost=0 这两条。
+# -raft-fsync=false 时 Sync 整条跳过，进程被杀之后页缓存归内核持有，重启读同一份文件仍能看到
+# 全部已确认字节，所以这一档也是 not_durable 0、lost 0；它只报数、不断言，差别要掉电才兑现。
 #
-# boot_ms 现在是日志全量回放的耗时：没有快照，它随写入条数线性涨（docs/8 §四 第 5 步才补快照）。
+# boot_ms 是日志全量回放的耗时：没有快照，它随写入条数线性涨（docs/5）。
 # 读回用 ?consistency=local：默认档是线性一致读，无 Leader 期间回 503，会把对账变成读路径的测试。
 set -euo pipefail
 
@@ -54,7 +53,7 @@ if [[ ! -x "$BIN" ]]; then
 	exit 1
 fi
 
-# 目录名与扩展名各收在这里：一份日志只有这一处口径（docs/8 §二）。
+# 目录名与扩展名各收在这里：一份日志只有这一处口径（docs/8 §一）。
 SEG_DIR_REL="raft/wal"
 SEG_EXT="wal"
 NODE_LOG_REL="log/miniraft-node.log"
@@ -183,7 +182,7 @@ done
 lost=$((acked - recovered))
 segments=$(find "$SEG_DIR" -name "*.$SEG_EXT" 2>/dev/null | wc -l | tr -d ' ')
 
-printf 'batch acked durable not_durable recovered lost boot_ms segments stale_tmp\n'
+printf 'fsync acked durable not_durable recovered lost boot_ms segments stale_tmp\n'
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 	"$FSYNC" "$acked" "$durable" "$not_durable" "$recovered" "$lost" "$boot_ms" "$segments" "$stale_tmp"
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 收掉 cluster_up.sh 起的 5 个进程：按清单逐个 SIGTERM，等各自退出，最后删掉清单。
 # 用法：scripts/cluster_down.sh [数据根目录=data]
-# SIGTERM 走的是 2.1 §4 的正常收尾（停 tick → 关在途提案 → Flush → 落盘 → 关文件）。
+# SIGTERM 走的是 2.1 §4 的正常收尾（停 tick → 关在途提案 → 关日志与游标文件 → 放目录锁）。
 # 这些进程不是本脚本的子进程（cluster_up.sh 一退出就被收养），拿不到 wait 的退出码，
 # 所以退出码读日志里最后一条 node stopped 的 exit_code 字段——2.1 §8 的「入口起停」就是为此而打。
 set -uo pipefail
