@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -48,8 +49,20 @@ type httpTransport struct {
 }
 
 // NewTransport 给入口层用；单测里的内存夹具实现的是同一个接口，两边调的是同一批处理函数（3.1 §4）。
+// 出站连接绑定到本节点在成员表里的地址：多机部署时源地址与身份一致，故障注入也能按
+// 源／目的地址精确切断一个方向（7 §网络和时钟）。
 func NewTransport(cfg Config) Transport {
-	return &httpTransport{client: &http.Client{Timeout: cfg.rpcTimeout()}}
+	client := &http.Client{Timeout: cfg.rpcTimeout()}
+	if own := cfg.Peers[cfg.NodeID]; own != "" {
+		if host, _, err := net.SplitHostPort(own); err == nil {
+			if ip := net.ParseIP(host); ip != nil && !ip.IsUnspecified() {
+				tr := http.DefaultTransport.(*http.Transport).Clone()
+				tr.DialContext = (&net.Dialer{LocalAddr: &net.TCPAddr{IP: ip}}).DialContext
+				client.Transport = tr
+			}
+		}
+	}
+	return &httpTransport{client: client}
 }
 
 func (t *httpTransport) RequestVote(to string, req VoteRequest) (VoteReply, error) {

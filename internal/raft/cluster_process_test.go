@@ -34,6 +34,8 @@ type processCluster struct {
 
 	// flags 是给每台机器都追加的启动参数：快照档的开关只在这里能换（5.1 §6）。
 	flags []string
+	// env 是每台机器额外的环境变量：故障注入的停点只挂在被注入的那一台上。
+	env map[string][]string
 }
 
 func buildNodeBinary(t *testing.T) string {
@@ -63,13 +65,20 @@ func newProcessCluster(t *testing.T, size int) *processCluster {
 // newProcessClusterFlags 起 size 个进程，flags 追加在每台机器的命令行上。
 func newProcessClusterFlags(t *testing.T, size int, flags []string) *processCluster {
 	t.Helper()
+	return newProcessClusterAtRoot(t, size, flags, t.TempDir())
+}
+
+// newProcessClusterAtRoot 把数据目录放到调用方指定的位置：磁盘故障用例要把节点放进小容量的 tmpfs。
+func newProcessClusterAtRoot(t *testing.T, size int, flags []string, root string) *processCluster {
+	t.Helper()
 	p := &processCluster{
 		flags: flags,
 		t:     t,
 		bin:   buildNodeBinary(t),
-		root:  t.TempDir(),
+		root:  root,
 		cmd:   map[string]*exec.Cmd{},
 		addr:  map[string]string{},
+		env:   map[string][]string{},
 	}
 	var items []string
 	for i := 1; i <= size; i++ {
@@ -103,6 +112,13 @@ func (p *processCluster) start() {
 // startOne 只起一台并等它就维：被 kill9 停下的节点按同一份数据目录重起来走的就是这条路。
 func (p *processCluster) startOne(id string) {
 	p.t.Helper()
+	p.spawnOne(id)
+	p.waitReady(id)
+}
+
+// spawnOne 起一台但不等就维：回放中途被杀的用例要自己挑杀的时刻，等就维就错过了窗口。
+func (p *processCluster) spawnOne(id string) {
+	p.t.Helper()
 	if c := p.cmd[id]; c != nil && c.ProcessState == nil {
 		p.t.Fatalf("node %s is already running in this fixture", id)
 	}
@@ -110,6 +126,9 @@ func (p *processCluster) startOne(id string) {
 	args := []string{"-node-id", id, "-peers", p.peers, "-data-dir", dir, "-log-level", "debug"}
 	args = append(args, p.flags...)
 	cmd := exec.Command(p.bin, args...)
+	if extra := p.env[id]; len(extra) > 0 {
+		cmd.Env = append(os.Environ(), extra...)
+	}
 	// 节点的日志都在数据目录的文件里，stdout 只是兜底：留着管道会让 Cleanup 等不到 EOF。
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
@@ -118,7 +137,6 @@ func (p *processCluster) startOne(id string) {
 		p.t.Fatalf("start %s: %v", id, err)
 	}
 	p.cmd[id] = cmd
-	p.waitReady(id)
 }
 
 func (p *processCluster) url(id, path string) string {
@@ -215,8 +233,11 @@ func (p *processCluster) kill9(id string) {
 	if cmd == nil || cmd.Process == nil {
 		p.t.Fatalf("node %s is not running in this fixture", id)
 	}
-	if err := cmd.Process.Kill(); err != nil {
-		p.t.Fatalf("kill -9 %s: %v", id, err)
+	// 整个进程组一起杀：节点可能被 strace 之类的父进程包着，只杀父进程会把节点留成孤儿。
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+		if err := cmd.Process.Kill(); err != nil {
+			p.t.Fatalf("kill -9 %s: %v", id, err)
+		}
 	}
 	state, err := cmd.Process.Wait()
 	if err != nil {
@@ -235,8 +256,14 @@ func (p *processCluster) stopAll() map[string]int {
 			delete(p.cmd, id)
 			continue
 		}
-		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			p.t.Errorf("signal %s: %v", id, err)
+		// 整个进程组一起发信号：节点可能被 strace 之类的父进程包着，
+		// 只发给父进程会留下一个还占着管道的子进程，Wait 就等不到头。
+		sigErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		if sigErr != nil {
+			sigErr = cmd.Process.Signal(syscall.SIGTERM)
+		}
+		if sigErr != nil && !errors.Is(sigErr, os.ErrProcessDone) && !errors.Is(sigErr, syscall.ESRCH) {
+			p.t.Errorf("signal %s: %v", id, sigErr)
 			continue
 		}
 		// 收尾窗口本身 5 秒，多给 10 秒等 fsync；超时就 kill -9，别让用例挂在这里。
@@ -245,7 +272,7 @@ func (p *processCluster) stopAll() map[string]int {
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
-			_ = cmd.Process.Kill()
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			<-done
 			p.t.Errorf("node %s did not exit on SIGTERM within 10s", id)
 		}

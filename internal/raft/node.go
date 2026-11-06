@@ -206,6 +206,14 @@ func NewNode(cfg Config, kv *kvstore.KV, tp Transport, lg *zap.Logger) (*Node, e
 		}
 		return nil, err
 	}
+	// 快照是已应用前缀的唯一来源：state 游标落后于快照点说明进程死在
+	// 「快照已提交、游标还没写」的窗口里，启动按快照把两个游标抬到快照点。
+	if snap != nil && st.LastApplied < snap.Index {
+		st.LastApplied = snap.Index
+		if st.CommitIndex < st.LastApplied {
+			st.CommitIndex = st.LastApplied
+		}
+	}
 	if err := checkCursors(st, rl.lastIndex(), snapshotIndexOf(snap)); err != nil {
 		_ = rl.close()
 		return nil, err
@@ -307,9 +315,6 @@ func checkCursors(st State, lastLogIndex, snapshotIndex uint64) error {
 	}
 	if st.LastApplied > st.CommitIndex {
 		return ErrStateMismatchAt(st.LastApplied, "lastApplied is past commitIndex")
-	}
-	if st.LastApplied < snapshotIndex {
-		return ErrStateMismatchAt(snapshotIndex, "the snapshot is ahead of lastApplied")
 	}
 	return nil
 }
@@ -535,6 +540,7 @@ func (n *Node) becomeCandidate() {
 	n.electionDeadline = n.rollElectionDeadline()
 	n.votes = 1
 	n.leaderID = ""
+	crashPoint("candidate-after-self-vote")
 
 	req := VoteRequest{
 		Term:         n.term,
@@ -670,11 +676,13 @@ func (n *Node) Propose(ctx context.Context, key, value string) (uint64, uint64, 
 		n.mu.Unlock()
 		return 0, 0, err
 	}
+	crashPoint("leader-before-sync")
 	if err := n.log.sync(); err != nil {
 		// Sync 失败时盘上边界未知，写路径由 wal 自己关掉（D5），这条不登记回调。
 		n.mu.Unlock()
 		return 0, 0, err
 	}
+	crashPoint("leader-after-sync")
 	wait := n.registerProposal(index)
 	// 自己这一票恒计入 replicaCount，成员表只有自己时多数派已经凑够，
 	// 当场推进提交点；多成员时这一句什么也不做，仍等回执。

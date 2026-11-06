@@ -34,13 +34,11 @@ func (n *Node) handleInstallSnapshot(index, term uint64, body []byte) (InstallSn
 	n.kv.Restore(entries)
 
 	// 4：把游标推到快照 index，commitIndex 取本地值与快照 index 的较大者。
+	// 游标必须等快照文件与指针都落了盘才写：反过来先写 state 再写快照，
+	// 进程死在中途会让 state 指向一份还不存在的快照，重启直接起不来。
 	n.lastApplied = index
 	n.commitIndex = max(n.commitIndex, index)
-	if err := n.state.store(n.currentState()); err != nil {
-		return InstallSnapshotReply{}, err
-	}
 
-	// 5：写本地快照文件与指针，删掉本地日志里 <= 快照 index 的条目。
 	snap := &Snapshot{
 		Index:    index,
 		Term:     term,
@@ -56,6 +54,10 @@ func (n *Node) handleInstallSnapshot(index, term uint64, body []byte) (InstallSn
 	}
 	n.snapshotIndex, n.snapshotTerm = index, term
 	n.snapshotVoters = append([]string(nil), voters...)
+	crashPoint("install-before-state")
+	if err := n.state.store(n.currentState()); err != nil {
+		return InstallSnapshotReply{}, err
+	}
 	if err := n.log.dropPrefix(index + 1); err != nil {
 		return InstallSnapshotReply{}, err
 	}

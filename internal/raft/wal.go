@@ -118,12 +118,16 @@ func openWALFrom(cfg Config, lg *zap.Logger, baseIndex, baseTerm uint64) (*wal, 
 	}
 	if len(entries) > 0 && entries[0].index < baseIndex {
 		// 快照覆盖了日志头部：这些条目不进视图，重启按快照点之后回放（5.1 §7 的启动恢复第 3 步）。
-		// 它们留在盘上，等这一轮压缩删前缀时一起清掉。
 		cut := 0
 		for cut < len(entries) && entries[cut].index < baseIndex {
 			cut++
 		}
 		l.entries = entries[cut:]
+		// 视图跳过的那一段字节也必须从盘上删掉：追加从视图末尾接着写，
+		// 旧字节后面直接写新 index，重启扫描会报「日志中间有洞」。
+		if err := l.trimStalePrefix(); err != nil {
+			return nil, err
+		}
 	}
 	l.rebuildTermIndex()
 
@@ -146,6 +150,48 @@ func openWALFrom(cfg Config, lg *zap.Logger, baseIndex, baseTerm uint64) (*wal, 
 	}
 	l.file, l.seq, l.size = f, firstWALSegment, 0
 	return l, nil
+}
+
+// trimStalePrefix 把盘上早于视图基线的字节删掉，让第一条可回放的记录落在段头。
+// 只由 openWALFrom 在视图已经跳过一段前缀时调用：留着这段字节，下一次追加
+// 就把新 index 写在旧记录之后，重启扫描读出来的就是日志中间有洞。
+func (l *wal) trimStalePrefix() error {
+	segs, err := listWALSegments(l.cfg)
+	if err != nil {
+		return err
+	}
+	if len(l.entries) == 0 {
+		// 盘上所有记录都在快照点之前：清空，追加从基线开始（5.1 §5 的基线口径）。
+		for _, s := range segs[:max(len(segs)-1, 0)] {
+			if err := os.Remove(s.path); err != nil {
+				return kvstore.ErrIOFrom("remove wal segment", 0, err)
+			}
+		}
+		if len(segs) > 0 {
+			return truncateWALFile(segs[len(segs)-1].path, 0)
+		}
+		return nil
+	}
+	first := l.entries[0]
+	for _, s := range segs {
+		if s.seq >= first.seq {
+			break
+		}
+		if err := os.Remove(s.path); err != nil {
+			return kvstore.ErrIOFrom("remove wal segment", 0, err)
+		}
+	}
+	if first.offset > 0 {
+		if _, err := rewriteWALSegment(l.cfg, first.seq, first.offset); err != nil {
+			return err
+		}
+		for _, e := range l.entries {
+			if e.seq == first.seq {
+				e.offset -= first.offset
+			}
+		}
+	}
+	return nil
 }
 
 // appendEntry 追加一条并检查 index 连续（不变式 6：日志中间不许有洞）。

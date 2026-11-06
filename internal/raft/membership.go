@@ -255,6 +255,7 @@ func (n *Node) changeMembershipLocked(id, role string) (uint64, uint64, error) {
 		// Sync 失败时盘上边界未知：视图不动、复制不排，返回 ErrIO（6.1 §4 契约表）。
 		return 0, 0, err
 	}
+	crashPoint("config-after-sync")
 
 	n.applyConfigLocked(configView{
 		voters:     next,

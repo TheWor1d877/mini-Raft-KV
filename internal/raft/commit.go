@@ -112,6 +112,7 @@ func (n *Node) applyCommitted() error {
 // 重启从那里回放会把已经生效的条目再 apply 一遍，赋值的幂等兜住（D4）。
 // 方向不能反：state 里的 lastApplied 永远不许领先于状态机真正应用的位置。
 func (n *Node) finishApply(through uint64) error {
+	crashPoint("apply-before-state")
 	previous := n.lastApplied
 	n.lastApplied = through
 	storeErr := n.state.store(n.currentState())

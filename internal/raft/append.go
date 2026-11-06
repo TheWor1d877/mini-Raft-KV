@@ -164,6 +164,7 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 		if err := n.log.sync(); err != nil {
 			return AppendReply{Term: n.term, Success: false, ReadRound: req.ReadRound}
 		}
+		crashPoint("follower-after-sync")
 	}
 
 	// 6：commitIndex = min(leaderCommit, 本地最后一条 index)，推进之后当场 apply。
