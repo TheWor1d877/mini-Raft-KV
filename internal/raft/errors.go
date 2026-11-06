@@ -18,7 +18,16 @@ var ErrStateMismatch = errors.New("raft state mismatch")
 var (
 	ErrNotLeader = errors.New("not the leader")
 	ErrCanceled  = errors.New("raft proposal canceled")
+	// ErrConfigRejected 是成员变更被拒的哨兵：四类原因共用一个 HTTP code，
+	// 具体原因写在错误文本里（6.1 §4、D40）。
+	ErrConfigRejected = errors.New("membership change rejected")
 )
+
+// ErrConfigRejectedFrom 把拒绝原因包进哨兵：调用方用 errors.Is 判类别，
+// 响应体的 error 字段读具体原因。
+func ErrConfigRejectedFrom(reason string) error {
+	return fmt.Errorf("%s: %w", reason, ErrConfigRejected)
+}
 
 type stateMismatchError struct {
 	reason string
@@ -55,6 +64,9 @@ func statusFor(err error) (int, string) {
 		return http.StatusInternalServerError, "corrupt_record"
 	case errors.Is(err, kvstore.ErrIO):
 		return http.StatusInternalServerError, "io_error"
+	case errors.Is(err, ErrConfigRejected):
+		// 成员变更的四类拒绝：请求本身合法，只是当前视图不接受（6.1 §4）。
+		return http.StatusConflict, "config_rejected"
 	case errors.Is(err, ErrStateMismatch):
 		// 快照点选不出来这一类：请求本身没问题，是节点的状态还没到（5.1 §4）。
 		return http.StatusConflict, "state_mismatch"

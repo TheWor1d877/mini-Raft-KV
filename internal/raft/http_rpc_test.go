@@ -801,7 +801,10 @@ func TestInstallSnapshotRouteShape(t *testing.T) {
 		}
 	}
 
-	body := snapshotBody(t, "snap", "sv")
+	body, err := encodeSnapshotFile([]kvstore.Entry{{Key: "snap", Value: "sv"}}, c.node[id].membership.clone())
+	if err != nil {
+		t.Fatalf("encode snapshot: %v", err)
+	}
 	garbled := bytes.Clone(body)
 	garbled[len(garbled)-1] ^= 0xff
 	status, raw := c.post(id, "/raft/install-snapshot?index=2&term=1", string(garbled))

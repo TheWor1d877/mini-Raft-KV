@@ -26,6 +26,10 @@ func (n *Node) handleRequestVote(req VoteRequest) VoteReply {
 	if req.Term < n.term {
 		return n.denyVote(req, "term_old")
 	}
+	// 2.5 learner 先按 term 规则处理完，再以 learner 拒绝：它没有投票权（6.1 §7）。
+	if !n.membership.isVoter(n.cfg.NodeID) {
+		return n.denyVote(req, "learner")
+	}
 	// 3. 本任期已经投过人，且不是这个候选人。
 	if n.votedFor != "" && n.votedFor != req.CandidateID {
 		return n.denyVote(req, "already_voted")
@@ -77,7 +81,7 @@ func (n *Node) handleVoteReply(req VoteRequest, reply VoteReply) {
 	}
 
 	n.votes++
-	needed := n.cfg.Majority()
+	needed := n.membership.majority()
 	n.lg.Info("votes counted",
 		zap.String("node_id", n.cfg.NodeID),
 		zap.Uint64("term", n.term),

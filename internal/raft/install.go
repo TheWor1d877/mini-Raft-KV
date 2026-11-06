@@ -17,7 +17,7 @@ type InstallSnapshotReply struct {
 // 快照字节是原文件的内容：校验、解码与落盘用的都是同一份。
 func (n *Node) handleInstallSnapshot(index, term uint64, body []byte) (InstallSnapshotReply, error) {
 	// 1：校验 magic、条目数与 crc32c，任一不符都算坏记录（5.1 §7 接收快照第 1 步）。
-	entries, err := decodeSnapshotFile(body)
+	entries, voters, err := decodeSnapshotFile(body, n.cfg.Peers)
 	if err != nil {
 		return InstallSnapshotReply{}, err
 	}
@@ -55,12 +55,19 @@ func (n *Node) handleInstallSnapshot(index, term uint64, body []byte) (InstallSn
 		return InstallSnapshotReply{}, err
 	}
 	n.snapshotIndex, n.snapshotTerm = index, term
+	n.snapshotVoters = append([]string(nil), voters...)
 	if err := n.log.dropPrefix(index + 1); err != nil {
 		return InstallSnapshotReply{}, err
 	}
 	if n.log.length() == 0 {
 		n.log.baseTerm = term
 	}
+	// 文件头里的投票集合覆盖本地视图，配置条目的压缩点随之前移（6.1 §7 接收快照）。
+	n.applyConfigLocked(configView{
+		voters:     voters,
+		index:      index,
+		prevVoters: n.membership.clone(),
+	})
 	n.lg.Info("snapshot installed",
 		zap.String("from_node", n.leaderID),
 		zap.Uint64("snapshot_index", index),

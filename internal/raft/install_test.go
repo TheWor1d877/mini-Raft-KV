@@ -38,10 +38,13 @@ func followerOf(t *testing.T, c *cluster, leaderID string) string {
 	return ""
 }
 
+// installTestVoters 是 3 节点夹具的快照投票集合；装快照不改视图，后面的复制与提交照常。
+var installTestVoters = []string{"node-1", "node-2", "node-3"}
+
 // snapshotBody 造一份快照文件的字节：一条键值。
 func snapshotBody(t *testing.T, key, value string) []byte {
 	t.Helper()
-	body, err := encodeSnapshotFile([]kvstore.Entry{{Key: key, Value: value}})
+	body, err := encodeSnapshotFile([]kvstore.Entry{{Key: key, Value: value}}, installTestVoters)
 	if err != nil {
 		t.Fatalf("encode snapshot: %v", err)
 	}
@@ -142,7 +145,7 @@ func TestInstallSnapshotRejectsACorruptFile(t *testing.T) {
 	copy(badMagic, "MRSNAPXX")
 
 	badCount := append([]byte(nil), valid...)
-	binary.BigEndian.PutUint32(badCount[snapshotMagicLen:snapshotHeaderLen], 2)
+	binary.BigEndian.PutUint32(badCount[snapshotMagicLen:snapshotMagicLen+snapshotCountLen], 2)
 
 	badCRC := append([]byte(nil), valid...)
 	badCRC[len(badCRC)-1] ^= 0xff
@@ -339,7 +342,7 @@ func TestWritesAfterAnInstallReachTheCaughtUpMember(t *testing.T) {
 	if snapIndex < 2 {
 		t.Fatalf("lastApplied = %d, want the two writes applied", snapIndex)
 	}
-	body, err := encodeSnapshotFile(c.kv(fid).Snapshot())
+	body, err := encodeSnapshotFile(c.kv(fid).Snapshot(), f.membership.clone())
 	if err != nil {
 		t.Fatalf("encode snapshot: %v", err)
 	}

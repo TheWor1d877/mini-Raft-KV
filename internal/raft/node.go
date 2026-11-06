@@ -134,6 +134,20 @@ type Node struct {
 	heartbeatElapsed int
 	votes            int
 
+	// 成员视图（6.1 §4）：投票集合跟着日志视图一起换，configIndex 是最后一条配置条目的
+	// index（没有配置条目时取快照点）。prevVoters 是它生效之前的集合，给双多数派用。
+	membership    memberSet
+	configIndex   uint64
+	prevVoters    []string
+	pendingConfig *pendingConfig
+	// snapshotVoters 是快照文件头里的投票集合，重建视图的起点（6.1 §7 启动与快照）。
+	snapshotVoters []string
+
+	// demoteTicks 是自动降级的阈值，按 tick 数计；0 表示关掉自动降级（D39）。
+	demoteTicks int
+	tickSeq     uint64
+	exemptSince map[string]uint64
+
 	// 复制游标：初值在当选时置好，成功回执推进它、冲突提示回退它（append.go）。
 	nextIndex  map[string]uint64
 	matchIndex map[string]uint64
@@ -218,12 +232,21 @@ func NewNode(cfg Config, kv *kvstore.KV, tp Transport, lg *zap.Logger) (*Node, e
 		applyWaiters:   applyWaiters{},
 		now:            monotonicNow,
 		leaseWindow:    leaseWindow(cfg),
+		exemptSince:    map[string]uint64{},
+	}
+	if cfg.LearnerDemoteMS > 0 {
+		n.demoteTicks = ticks(cfg.LearnerDemoteMS, cfg.TickMS)
+	}
+	if snap != nil {
+		n.snapshotVoters = append([]string(nil), snap.Voters...)
 	}
 	n.electionDeadline = n.rollElectionDeadline()
 	// 启动序列的第二步：状态机先由快照重建，快照点之前的状态只从快照来（不变式 7）。
 	if snap != nil {
 		n.kv.Restore(snapEntries)
 	}
+	// 视图先按快照头加重算，再回放日志：配置条目在追加时生效，恢复时也一样（6.1 §7）。
+	n.rebuildConfigLocked()
 	// 启动序列的第三步：map 由日志回放重建，KV WAL 不参与恢复（docs/8 第 1 步）。
 	if err := n.replayLog(); err != nil {
 		_ = n.log.close()
@@ -251,6 +274,13 @@ func (n *Node) replayLog() error {
 			continue
 		}
 		if len(e.cmd) == 0 {
+			continue
+		}
+		if isConfigEntry(e.cmd) {
+			// 配置条目没有 KV 副作用；视图已经由 rebuildConfigLocked 按整份日志重算过。
+			if _, err := decodeConfig(e.cmd, n.cfg.Peers); err != nil {
+				return err
+			}
 			continue
 		}
 		key, value, err := kvstore.DecodeEntry(e.cmd, e.offset)
@@ -369,6 +399,13 @@ func (n *Node) drainOutbox() {
 
 func (n *Node) tickLocked() {
 	if n.role == RoleLeader {
+		n.tickSeq++
+		// 豁免计时按 tick 推进；到期就把落后成员降成 learner（6.1 §7 自动降级、D39）。
+		n.checkAutoDemotionLocked()
+		if n.role != RoleLeader {
+			// 自降发生在这一拍里：后面的心跳与确认轮不再由一个 learner 发起。
+			return
+		}
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed < n.heartbeatTicks {
 			return
@@ -381,6 +418,11 @@ func (n *Node) tickLocked() {
 	}
 	n.electionDeadline--
 	if n.electionDeadline > 0 {
+		return
+	}
+	if !n.membership.isVoter(n.cfg.NodeID) {
+		// learner 的选举截止照常递减，到点只重置，不发选举（6.1 §7 选举与读）。
+		n.electionDeadline = n.rollElectionDeadline()
 		return
 	}
 	n.becomeCandidate()
@@ -500,10 +542,11 @@ func (n *Node) becomeCandidate() {
 		LastLogIndex: n.log.lastIndex(),
 		LastLogTerm:  n.log.lastTerm(),
 	}
-	for _, peerID := range n.cfg.otherPeers() {
+	// 候选人只给投票集合里的成员发投票，learner 一次也收不到（6.1 §7）。
+	for _, peerID := range n.membership.others(n.cfg.NodeID) {
 		n.outbox = append(n.outbox, rpcTask{peerID: peerID, vote: &req})
 	}
-	if n.votes >= n.cfg.Majority() {
+	if n.votes >= n.membership.majority() {
 		n.becomeLeader("self-vote is a majority")
 	}
 }
@@ -531,6 +574,9 @@ func (n *Node) becomeLeader(reason string) {
 	n.leaderID = n.cfg.NodeID
 	n.heartbeatElapsed = 0
 	n.votes = 0
+	// 自动降级的计时从这一任 Leader 的第一次 Tick 起算，不继承上一任的豁免记录（D39）。
+	n.tickSeq = 0
+	n.exemptSince = map[string]uint64{}
 
 	n.nextIndex = map[string]uint64{}
 	n.matchIndex = map[string]uint64{}

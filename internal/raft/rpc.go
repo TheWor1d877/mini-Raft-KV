@@ -23,6 +23,7 @@ const (
 	routeAppendEntries   = "/raft/append-entries"
 	routeSnapshot        = "/raft/snapshot"
 	routeInstallSnapshot = "/raft/install-snapshot"
+	routeMembership      = "/raft/membership"
 	routePut             = "/put"
 	routeGet             = "/get"
 
@@ -167,13 +168,17 @@ func (h *nodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleSnapshot(w, r, reqID, start)
 	case r.URL.Path == routeInstallSnapshot && r.Method == http.MethodPost:
 		h.handleInstallSnapshot(w, r, reqID, start)
+	case r.URL.Path == routeMembership && r.Method == http.MethodPost:
+		h.handleMembership(w, r, reqID, start)
+	case r.URL.Path == routeMembership && r.Method == http.MethodGet:
+		h.handleMembershipQuery(w, r, reqID, start)
 	case r.URL.Path == routePut && r.Method == http.MethodPost:
 		h.handlePut(w, r, reqID, start)
 	case r.URL.Path == routeGet && r.Method == http.MethodGet:
 		h.handleGet(w, r, reqID, start)
 	case h.isKnownRoute(r.URL.Path):
 		h.fail(w, r.URL.Path, reqID, http.StatusMethodNotAllowed,
-			"method_not_allowed", "routes are POST /raft/request-vote, POST /raft/append-entries, POST /raft/snapshot, POST /raft/install-snapshot, POST /put and GET /get", 0, start)
+			"method_not_allowed", "routes are POST /raft/request-vote, POST /raft/append-entries, POST /raft/snapshot, POST /raft/install-snapshot, POST /raft/membership, GET /raft/membership, POST /put and GET /get", 0, start)
 	default:
 		h.fail(w, r.URL.Path, reqID, http.StatusNotFound,
 			"not_found", "unknown route", 0, start)
@@ -182,7 +187,7 @@ func (h *nodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *nodeHandler) isKnownRoute(path string) bool {
 	switch path {
-	case routeRequestVote, routeAppendEntries, routeSnapshot, routeInstallSnapshot, routePut, routeGet:
+	case routeRequestVote, routeAppendEntries, routeSnapshot, routeInstallSnapshot, routeMembership, routePut, routeGet:
 		return true
 	default:
 		return false
@@ -277,6 +282,60 @@ func (h *nodeHandler) handleInstallSnapshot(w http.ResponseWriter, r *http.Reque
 	h.ok(w, routeInstallSnapshot, reqID, reply, start)
 }
 
+// membershipRequest 是 POST /raft/membership 的请求体（6.1 §4 的形状表）。
+type membershipRequest struct {
+	ID   string `json:"id"`
+	Role string `json:"role"`
+}
+
+type membershipResponse struct {
+	OK    bool   `json:"ok"`
+	Index uint64 `json:"index"`
+	Term  uint64 `json:"term"`
+}
+
+type membershipQueryResponse struct {
+	Voters   []string `json:"voters"`
+	Learners []string `json:"learners"`
+	Index    uint64   `json:"index"`
+	Term     uint64   `json:"term"`
+	LeaderID string   `json:"leader_id"`
+}
+
+// handleMembership 提交一次角色变更：缺字段或 role 不是 voter／learner 回 400，
+// 非 Leader 回 503，四类拒绝回 409 config_rejected（6.1 §4、D40）。
+func (h *nodeHandler) handleMembership(w http.ResponseWriter, r *http.Request, reqID string, start time.Time) {
+	var body membershipRequest
+	if err := decodeOne(r, maxRPCBodyBytes, membershipFields, &body); err != nil {
+		h.badBody(w, routeMembership, reqID, err, start)
+		return
+	}
+	if body.Role != MemberVoter && body.Role != MemberLearner {
+		h.fail(w, routeMembership, reqID, http.StatusBadRequest, "bad_request",
+			fmt.Sprintf("role %q must be %s or %s", body.Role, MemberVoter, MemberLearner), 0, start)
+		return
+	}
+	index, term, err := h.n.changeMembership(body.ID, body.Role)
+	if err != nil {
+		if errors.Is(err, ErrNotLeader) {
+			h.notLeader(w, routeMembership, reqID, err, start)
+			return
+		}
+		h.failWithError(w, routeMembership, reqID, err, start)
+		return
+	}
+	h.ok(w, routeMembership, reqID, membershipResponse{OK: true, Index: index, Term: term}, start)
+}
+
+// handleMembershipQuery 读当前视图：voters 与 learners 都升序，并带 configIndex 与 term（6.1 §4）。
+func (h *nodeHandler) handleMembershipQuery(w http.ResponseWriter, r *http.Request, reqID string, start time.Time) {
+	voters, learners, index, term := h.n.Membership()
+	leaderID, _, _ := h.n.Leader()
+	h.ok(w, routeMembership, reqID, membershipQueryResponse{
+		Voters: voters, Learners: learners, Index: index, Term: term, LeaderID: leaderID,
+	}, start)
+}
+
 type putRequest struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
@@ -324,9 +383,10 @@ type notLeaderResponse struct {
 // append-entries 的 readRound 也在必填之列：补零之后，为读发起的确认轮与例行心跳
 // 在请求上就分不出来了（4.1 §4、D25）。
 var (
-	voteFields   = []string{"term", "candidateId", "lastLogIndex", "lastLogTerm"}
-	appendFields = []string{"term", "leaderId", "prevLogIndex", "prevLogTerm", "entries", "leaderCommit", "readRound"}
-	putFields    = []string{"key", "value"}
+	voteFields       = []string{"term", "candidateId", "lastLogIndex", "lastLogTerm"}
+	appendFields     = []string{"term", "leaderId", "prevLogIndex", "prevLogTerm", "entries", "leaderCommit", "readRound"}
+	membershipFields = []string{"id", "role"}
+	putFields        = []string{"key", "value"}
 )
 
 func (h *nodeHandler) handlePut(w http.ResponseWriter, r *http.Request, reqID string, start time.Time) {

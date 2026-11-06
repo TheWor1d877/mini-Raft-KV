@@ -7,31 +7,15 @@
 动手前先想清楚。遇到拿不准的决策，或对话、文档、代码中存在明显矛盾时，必须先提问确认，确保完全按用户的方向推进，不主观臆断、不自行补全。不清楚就多问。
 
 #### 耗时任务
-在某一步长时间卡住（镜像拉取、脚本执行等），要立刻告知用户当前状态、需要谁解决、预计还要多久。
+在某一步长时间卡住（脚本执行、批量测试等），要立刻告知用户当前状态、需要谁解决、预计还要多久。
 先回答用户的问题，再执行长时间任务。答案第一时间给，不等全部跑完再一起回复，绝不让用户干等。
 
 ## 文件命名
 文件名说明内容，不记录过程。按模块、职责或被测行为取名，如 `logs_assert_test.go`、`adaptive_fanout_test.go`、`run_compare.sh`；里程碑、阶段、批次编号（`m12_`、`m7_`、`phase2_`）不进文件名，只出现在提交信息与 issue 里。
 
-## 镜像拉取
-docker 拉取加速用 `/etc/docker/daemon.json` 的 `registry-mirrors`；镜像站域名不写进 Dockerfile、清单、脚本或文档。
-k8s/containerd 不读 daemon.json。镜像拉不到时先在宿主机 `docker pull`，再 `kind load`，不要给清单里的镜像名加域名前缀。
-拉取问题长时间无法解决就保留进度并中断，交给用户处理。
-
-## 版本、镜像与发布物
-- 版本号唯一来源是 git tag `vX.Y.Z`；镜像 tag、二进制注入版本、CHANGELOG 标题逐字一致，统一带 `v`。
-- 镜像名固定 `ghcr.io/thewor1d877/traincache/<组件>`：开发打 `:dev`，候选打 `sha-<7 位短 sha>`，发布清单用 `@sha256`。仓库内任何文件不得出现私有镜像站域名。
-- Dockerfile 不设镜像站参数，基础镜像写官方短名，拉取加速交给 docker daemon 的 `registry-mirrors`。
-- 仓库内清单的镜像 tag 写 `dev`；发布清单由 kustomize `images:` 渲染，四个 Traincache 镜像用 `@sha256` 固定，不手改 YAML。
-- `controller/deploy/observability/` 是 dev-only 装置，不进发布包，也不得引用到发布清单。
-- 文档正文只写当前状态，不标“v几新增”；版本历史只记 `CHANGELOG.md`；只有对外契约表（CRD 字段、env、CLI flag）标“起始版本”。
-- `CHANGELOG.md` 只在发版时更新：`dev` 日常提交不写；`dev` 合并 `main`、打 tag 前补该版本条目。
-- 旧版本接口用 `git show <tag>:<path>` 查,不在 main 上维护旧版文档副本。
-- 完整口径见 `docs/RELEASE-CONSTRAINTS.md`,本节的规则在那里展开。
-
 ## 文档写作硬性要求(非常重要，必须最高优先级遵守)
 
-你为计算机专业本科生写技术文档。读者懂 Go、Kubernetes、存储和网络基础（Pod、gRPC 这类常识不解释），但不了解本项目实现与内部术语。只写事实记录，不写过程叙述。
+你为计算机专业本科生写技术文档。读者懂 Go、存储和网络基础（HTTP、JSON、Raft 这类常识不解释），但不了解本项目实现与内部术语。只写事实记录，不写过程叙述。
 
 #### A. 反追加、反过程
 

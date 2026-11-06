@@ -113,6 +113,19 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 		// 日志解释不了的赋值，重启的游标校验也救不回来（docs/8 §六）。
 		// 整条请求拒掉、日志与游标都不动；回退提示指向 lastApplied+1，
 		// Leader 只有从已应用的位置往后接才可能过这一关。
+		// 先把这一批里的配置条目校验完：坏条目整条请求拒掉，日志与视图都不动（6.1 §5）。
+		for _, e := range req.Entries {
+			if isConfigEntry(e.Command) {
+				if _, err := decodeConfig(e.Command, n.cfg.Peers); err != nil {
+					n.lg.Warn("append refused: bad config entry",
+						zap.String("node_id", n.cfg.NodeID),
+						zap.String("leader_id", req.LeaderID),
+						zap.Uint64("index", e.Index),
+						zap.Error(err))
+					return AppendReply{Term: n.term, Success: false, ReadRound: req.ReadRound}
+				}
+			}
+		}
 		if req.PrevLogIndex < n.lastApplied {
 			n.lg.Warn("append refused: would truncate an applied position",
 				zap.String("node_id", n.cfg.NodeID),
@@ -125,9 +138,27 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 		if err := n.log.truncateTo(req.PrevLogIndex); err != nil {
 			return AppendReply{Term: n.term, Success: false, ReadRound: req.ReadRound}
 		}
+		// 截掉的后缀里可能有配置条目：视图必须由剩下的日志重算（6.1 §7 接收与截断）。
+		n.rebuildConfigLocked()
 		for _, e := range req.Entries {
 			if _, err := n.log.appendEntry(e.Term, e.Index, e.Command); err != nil {
 				return AppendReply{Term: n.term, Success: false, ReadRound: req.ReadRound}
+			}
+			// 配置条目进入本地日志就生效，不等提交（6.1 §8 不变式 1）。
+			if isConfigEntry(e.Command) {
+				voters, err := decodeConfig(e.Command, n.cfg.Peers)
+				if err != nil {
+					return AppendReply{Term: n.term, Success: false, ReadRound: req.ReadRound}
+				}
+				n.applyConfigLocked(configView{
+					voters:     voters,
+					index:      e.Index,
+					prevVoters: n.membership.clone(),
+				})
+				n.lg.Info("membership applied from wal",
+					zap.String("node_id", n.cfg.NodeID),
+					zap.Strings("voters", n.membership.voters),
+					zap.Uint64("config_index", n.configIndex))
 			}
 		}
 		if err := n.log.sync(); err != nil {
@@ -138,6 +169,7 @@ func (n *Node) handleAppendEntries(req AppendRequest) AppendReply {
 	// 6：commitIndex = min(leaderCommit, 本地最后一条 index)，推进之后当场 apply。
 	if req.LeaderCommit > n.commitIndex {
 		n.commitIndex = min(req.LeaderCommit, n.log.lastIndex())
+		n.clearCommittedConfigLocked()
 	}
 	// apply 失败不改这条回执：条目已在本地日志里 Sync 完成，复制的承诺就此兑现，
 	// 状态机进不去是 kv 层那条链的事（D5）。

@@ -122,12 +122,14 @@ func (n *Node) runSnapshot() (uint64, error) {
 			zap.Uint64("lag_entries", n.commitIndex-n.lastApplied))
 	}
 	// 导出与快照点在同一段持锁内完成，导出的内容正好是快照点那一刻的状态（不变式 8）。
+	// 投票集合同样取这一刻的视图，写进快照文件头（6.1 §7 生成快照）。
 	entries := n.kv.Snapshot()
+	voters := n.membership.clone()
 	n.snapshotting = true
 	n.mu.Unlock()
 
 	start := time.Now()
-	snap, err := n.snap.create(index, term, entries)
+	snap, err := n.snap.create(index, term, entries, voters)
 	if err != nil {
 		n.finishSnapshot()
 		return 0, err
@@ -142,6 +144,7 @@ func (n *Node) runSnapshot() (uint64, error) {
 		return 0, err
 	}
 	n.snapshotIndex, n.snapshotTerm = snap.Index, snap.Term
+	n.snapshotVoters = append([]string(nil), snap.Voters...)
 	n.lastSnapshotMS = monotonicMS()
 	n.lg.Info("snapshot created",
 		zap.Uint64("snapshot_index", snap.Index),

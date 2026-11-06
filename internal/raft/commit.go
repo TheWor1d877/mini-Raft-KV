@@ -14,28 +14,51 @@ const maxApplyEntries = 64
 // 旧任期的条目要等它后面的当前任期条目落定才被间接带走。
 // 从日志末尾往前扫，第一个同时满足「属于当前任期」和「多数派已到该位置」的 index 就是新边界。
 func (n *Node) advanceCommit() {
+	pending := n.pendingConfig
 	for index := n.log.lastIndex(); index > n.commitIndex; index-- {
 		e, ok := n.log.entryAt(index)
-		if !ok || e.term != n.term {
+		if !ok {
 			continue
 		}
-		if n.replicaCount(index) >= n.cfg.Majority() {
-			n.commitIndex = index
-			return
+		// 提交屏障：未提交的配置条目后面的普通条目不能先把它带过提交点（6.1 §8 不变式 5）。
+		if pending != nil && index > pending.index {
+			continue
 		}
+		if pending != nil && index == pending.index {
+			// 配置条目要旧集合与新集合各有多数派（D38）。这一条不看任期：
+			// 换届之后新 Leader 要能把上一任留下的配置条目结掉，否则屏障会卡住所有后续条目。
+			if !n.majorityReplicated(pending.old, index) || !n.majorityReplicated(pending.new, index) {
+				continue
+			}
+		} else {
+			if e.term != n.term || !n.majorityReplicated(n.membership.voters, index) {
+				continue
+			}
+		}
+		n.commitIndex = index
+		n.clearCommittedConfigLocked()
+		return
 	}
 }
 
-// replicaCount 是日志至少到 index 的节点数。自己那条已在本地日志里，恒计入；
-// matchIndex 只记其余成员，Leader 不给自己发 AppendEntries（3.1 §7）。
-func (n *Node) replicaCount(index uint64) int {
-	count := 1
-	for _, peerID := range n.cfg.otherPeers() {
-		if n.matchIndex[peerID] >= index {
+// replicaCount 是投票集合里日志至少到 index 的节点数。自己那条已在本地日志里，
+// 且自己必在投票集合里，恒计入；matchIndex 只记其余成员（3.1 §7、6.1 §8 不变式 2）。
+func (n *Node) replicaCount(voters []string, index uint64) int {
+	count := 0
+	for _, id := range voters {
+		if id == n.cfg.NodeID || n.matchIndex[id] >= index {
 			count++
 		}
 	}
 	return count
+}
+
+// majorityReplicated 判断一组投票者里有没有多数派已经复制到 index。
+func (n *Node) majorityReplicated(voters []string, index uint64) bool {
+	if len(voters) == 0 {
+		return false
+	}
+	return n.replicaCount(voters, index) >= len(voters)/2+1
 }
 
 // applyCommitted 把 (lastApplied, commitIndex] 应用进 KV 状态机（不变式 4）。
@@ -49,11 +72,18 @@ func (n *Node) applyCommitted() error {
 			return ErrStateMismatchAt(index, "commitIndex points past the wal")
 		}
 		if len(e.cmd) > 0 {
-			key, value, err := kvstore.DecodeEntry(e.cmd, e.offset)
-			if err != nil {
-				return err
+			if isConfigEntry(e.cmd) {
+				// 配置条目没有 KV 副作用；视图在追加时已经生效，这里只校验记录完好（6.1 §7）。
+				if _, err := decodeConfig(e.cmd, n.cfg.Peers); err != nil {
+					return err
+				}
+			} else {
+				key, value, err := kvstore.DecodeEntry(e.cmd, e.offset)
+				if err != nil {
+					return err
+				}
+				n.kv.Apply(key, value)
 			}
-			n.kv.Apply(key, value)
 		}
 		n.lg.Debug("entry applied",
 			zap.String("node_id", n.cfg.NodeID),

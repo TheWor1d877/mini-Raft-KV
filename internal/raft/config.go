@@ -37,6 +37,9 @@ const (
 	DefaultSnapshotMinIntervalMS = int64(60000)
 	DefaultSnapshotExemptEntries = uint64(1000)
 
+	// 自动降级的默认阈值：成员被豁免出 safeIndex 之后连续 5 分钟降级为 learner（6.1 §6）。
+	DefaultLearnerDemoteMS = int64(300000)
+
 	RaftDirName      = "raft"
 	WALDirName       = "wal"
 	StateFileName    = "state"
@@ -98,6 +101,9 @@ type Config struct {
 	SnapshotBytes         int64
 	SnapshotMinIntervalMS int64
 	SnapshotExemptEntries uint64
+
+	// LearnerDemoteMS 是自动降级的阈值；0 关掉自动降级（6.1 §6）。`
+	LearnerDemoteMS int64
 }
 
 func DefaultConfig() Config {
@@ -116,6 +122,7 @@ func DefaultConfig() Config {
 		SnapshotBytes:         DefaultSnapshotBytes,
 		SnapshotMinIntervalMS: DefaultSnapshotMinIntervalMS,
 		SnapshotExemptEntries: DefaultSnapshotExemptEntries,
+		LearnerDemoteMS:       DefaultLearnerDemoteMS,
 	}
 }
 
@@ -233,6 +240,9 @@ func (c Config) Validate() error {
 	if c.SnapshotMinIntervalMS < 0 {
 		return fmt.Errorf("snapshot min interval %dms must not be negative", c.SnapshotMinIntervalMS)
 	}
+	if c.LearnerDemoteMS < 0 {
+		return fmt.Errorf("learner demote %dms must not be negative", c.LearnerDemoteMS)
+	}
 	// 一轮广播的最坏耗时是 (N-1) 次串行 RPC（4.1 §6、D23）。
 	broadcastMS := int64(len(c.Peers)-1) * c.rpcTimeout().Milliseconds()
 	switch c.ReadMode {
@@ -307,6 +317,7 @@ func load(name string, args []string, memberTable bool) (Config, kvstore.Config,
 	fs.Int64Var(&cfg.SnapshotBytes, "snapshot-bytes", cfg.SnapshotBytes, "log directory size that triggers one snapshot")
 	fs.Int64Var(&cfg.SnapshotMinIntervalMS, "snapshot-min-interval-ms", cfg.SnapshotMinIntervalMS, "minimum interval between two snapshots")
 	fs.Uint64Var(&cfg.SnapshotExemptEntries, "snapshot-exempt-entries", cfg.SnapshotExemptEntries, "lag entries behind which a member is exempt from the safe index")
+	fs.Int64Var(&cfg.LearnerDemoteMS, "learner-demote-ms", cfg.LearnerDemoteMS, "how long an exempt member stays behind before it is demoted to learner; 0 disables auto demotion")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, kvstore.Config{}, err
 	}

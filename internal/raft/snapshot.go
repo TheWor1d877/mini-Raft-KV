@@ -29,10 +29,13 @@ import (
 const (
 	OpSnapshotRecord = byte(0x20)
 
-	snapshotMagic     = "MRSNAP01"
-	snapshotMagicLen  = 8
-	snapshotCountLen  = 4
-	snapshotHeaderLen = snapshotMagicLen + snapshotCountLen
+	// MRSNAP02 在条目数之后加了一段投票集合：压缩之后它是视图的唯一来源（6.1 §5、D36）。
+	snapshotMagic         = "MRSNAP02"
+	snapshotMagicLen      = 8
+	snapshotCountLen      = 4
+	snapshotVoterCountLen = 2
+	snapshotHeaderLen     = snapshotMagicLen + snapshotCountLen + snapshotVoterCountLen
+	maxSnapshotVoterIDLen = 255
 )
 
 // snapshotter 负责快照文件与元数据指针的读写（5.1 §2）。
@@ -47,11 +50,12 @@ func newSnapshotter(cfg Config, lg *zap.Logger) *snapshotter {
 
 // Snapshot 是一份快照的元数据：指针文件里记的就是这些字段（5.1 §4）。
 type Snapshot struct {
-	Index    uint64 // 快照点对应的日志 index
-	Term     uint64 // 该 index 处的 term
-	Entries  int    // 快照里的键值条数
-	Bytes    int64  // 快照文件字节数
-	Checksum uint32 // 整份文件的 crc32c
+	Index    uint64   // 快照点对应的日志 index
+	Term     uint64   // 该 index 处的 term
+	Entries  int      // 快照里的键值条数
+	Bytes    int64    // 快照文件字节数
+	Checksum uint32   // 整份文件的 crc32c
+	Voters   []string // 快照点上的投票集合，写成文件头的一段
 }
 
 // snapshotPointer 是 `raft/snapshot/current.json` 的一行 JSON（D31）。
@@ -127,11 +131,28 @@ func decodeSnapshotRecord(payload []byte, offset int64) (string, string, error) 
 	return key, string(rest[4:]), nil
 }
 
-// encodeSnapshotFile 把状态机的全量键值编成一份快照文件的字节。
-func encodeSnapshotFile(entries []kvstore.Entry) ([]byte, error) {
+// encodeSnapshotFile 把状态机的全量键值与快照点上的投票集合编成一份快照文件的字节。
+func encodeSnapshotFile(entries []kvstore.Entry, voters []string) ([]byte, error) {
 	out := make([]byte, 0, snapshotHeaderLen+len(entries)*64)
 	out = append(out, snapshotMagic...)
 	out = binary.BigEndian.AppendUint32(out, uint32(len(entries)))
+	out = binary.BigEndian.AppendUint16(out, uint16(len(voters)))
+	if len(voters) == 0 {
+		return nil, kvstore.ErrCorruptAt(0, "snapshot has no voters")
+	}
+	for i, id := range voters {
+		if id == "" {
+			return nil, kvstore.ErrCorruptAt(0, "snapshot has an empty voter id")
+		}
+		if len(id) > maxSnapshotVoterIDLen {
+			return nil, kvstore.ErrCorruptAt(0, fmt.Sprintf("voter id %q is over the %d-byte limit", id, maxSnapshotVoterIDLen))
+		}
+		if i > 0 && id <= voters[i-1] {
+			return nil, kvstore.ErrCorruptAt(0, fmt.Sprintf("voter id %q is duplicated or out of order", id))
+		}
+		out = binary.BigEndian.AppendUint16(out, uint16(len(id)))
+		out = append(out, id...)
+	}
 	for _, e := range entries {
 		payload, err := encodeSnapshotRecord(e.Key, e.Value)
 		if err != nil {
@@ -146,52 +167,78 @@ func encodeSnapshotFile(entries []kvstore.Entry) ([]byte, error) {
 	return out, nil
 }
 
-// decodeSnapshotFile 解一份快照文件的字节：magic、条目数与每帧的 crc 任一不符都算坏记录。
-func decodeSnapshotFile(data []byte) ([]kvstore.Entry, error) {
+// decodeSnapshotFile 解一份快照文件的字节：magic、条目数、投票集合与每帧的 crc
+// 任一不符都算坏记录。known 是地址表，头部出现表外 id 同样判坏（6.1 §5）。
+func decodeSnapshotFile(data []byte, known map[string]string) ([]kvstore.Entry, []string, error) {
 	if len(data) < snapshotHeaderLen {
-		return nil, kvstore.ErrCorruptAt(0, "snapshot file is shorter than its header")
+		return nil, nil, kvstore.ErrCorruptAt(0, "snapshot file is shorter than its header")
 	}
 	if string(data[:snapshotMagicLen]) != snapshotMagic {
-		return nil, kvstore.ErrCorruptAt(0, "snapshot file magic mismatch")
+		return nil, nil, kvstore.ErrCorruptAt(0, "snapshot file magic mismatch")
 	}
-	count := int(binary.BigEndian.Uint32(data[snapshotMagicLen:snapshotHeaderLen]))
+	count := int(binary.BigEndian.Uint32(data[snapshotMagicLen : snapshotMagicLen+snapshotCountLen]))
+	voterCount := int(binary.BigEndian.Uint16(data[snapshotMagicLen+snapshotCountLen : snapshotHeaderLen]))
+	if voterCount == 0 {
+		return nil, nil, kvstore.ErrCorruptAt(int64(snapshotMagicLen+snapshotCountLen), "snapshot has no voters")
+	}
+
+	voters := make([]string, 0, voterCount)
+	offset := int64(snapshotHeaderLen)
+	for i := 0; i < voterCount; i++ {
+		if offset+2 > int64(len(data)) {
+			return nil, nil, kvstore.ErrCorruptAt(offset, "snapshot ends inside a voter id length")
+		}
+		size := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if size == 0 || offset+int64(size) > int64(len(data)) {
+			return nil, nil, kvstore.ErrCorruptAt(offset, "snapshot voter id is empty or runs past the file end")
+		}
+		id := string(data[offset : offset+int64(size)])
+		offset += int64(size)
+		if _, ok := known[id]; !ok {
+			return nil, nil, kvstore.ErrCorruptAt(offset-int64(size), fmt.Sprintf("voter id %q is not in the address table", id))
+		}
+		if i > 0 && id <= voters[i-1] {
+			return nil, nil, kvstore.ErrCorruptAt(offset-int64(size), fmt.Sprintf("voter id %q is duplicated or out of order", id))
+		}
+		voters = append(voters, id)
+	}
 
 	out := make([]kvstore.Entry, 0, count)
-	offset := int64(snapshotHeaderLen)
 	for i := 0; i < count; i++ {
 		if offset+int64(kvstore.FrameHeaderSize) > int64(len(data)) {
-			return nil, kvstore.ErrCorruptAt(offset, "snapshot file ends inside a frame header")
+			return nil, nil, kvstore.ErrCorruptAt(offset, "snapshot file ends inside a frame header")
 		}
 		head := data[offset : offset+kvstore.FrameHeaderSize]
 		size, checksum, err := kvstore.DecodeFrame(head, offset)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		start := offset + kvstore.FrameHeaderSize
 		if start+int64(size) > int64(len(data)) {
-			return nil, kvstore.ErrCorruptAt(offset, "snapshot frame runs past the file end")
+			return nil, nil, kvstore.ErrCorruptAt(offset, "snapshot frame runs past the file end")
 		}
 		payload := data[start : start+int64(size)]
 		if err := kvstore.CheckFrame(size, checksum, payload, offset); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		key, value, err := decodeSnapshotRecord(payload, offset)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		out = append(out, kvstore.Entry{Key: key, Value: value})
 		offset = start + int64(size)
 	}
 	if offset != int64(len(data)) {
-		return nil, kvstore.ErrCorruptAt(offset, "snapshot file has trailing bytes")
+		return nil, nil, kvstore.ErrCorruptAt(offset, "snapshot file has trailing bytes")
 	}
-	return out, nil
+	return out, voters, nil
 }
 
 // create 生成一份快照并原子提交：临时名写入 → Sync → 改名 → Sync 父目录（5.1 §7 的生成与提交第 2 步）。
 // 改名之前失败不留正式名文件，正式名一出现就是一次提交。
-func (s *snapshotter) create(index, term uint64, entries []kvstore.Entry) (*Snapshot, error) {
-	data, err := encodeSnapshotFile(entries)
+func (s *snapshotter) create(index, term uint64, entries []kvstore.Entry, voters []string) (*Snapshot, error) {
+	data, err := encodeSnapshotFile(entries, voters)
 	if err != nil {
 		return nil, err
 	}
@@ -206,6 +253,7 @@ func (s *snapshotter) create(index, term uint64, entries []kvstore.Entry) (*Snap
 		Entries:  len(entries),
 		Bytes:    int64(len(data)),
 		Checksum: crc32.Checksum(data, snapshotCRCTable),
+		Voters:   append([]string(nil), voters...),
 	}, nil
 }
 
@@ -318,7 +366,7 @@ func (s *snapshotter) load() (*Snapshot, []kvstore.Entry, error) {
 			zap.Uint32("file_checksum", got))
 		return nil, nil, nil
 	}
-	entries, err := decodeSnapshotFile(data)
+	entries, voters, err := decodeSnapshotFile(data, s.cfg.Peers)
 	if err != nil {
 		s.lg.Warn("snapshot file unusable, starting without a snapshot",
 			zap.Uint64("snapshot_index", pointer.SnapshotIndex), zap.Error(err))
@@ -330,6 +378,7 @@ func (s *snapshotter) load() (*Snapshot, []kvstore.Entry, error) {
 		Entries:  pointer.Entries,
 		Bytes:    pointer.Bytes,
 		Checksum: pointer.Checksum,
+		Voters:   voters,
 	}
 	return snap, entries, nil
 }

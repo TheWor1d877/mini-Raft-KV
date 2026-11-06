@@ -15,6 +15,13 @@ import (
 	"github.com/TheWor1d877/mini-Raft-KV/internal/kvstore"
 )
 
+// 快照测试用一组固定的投票集合与地址表：结构校验只要求 id 在地址表里，
+// 具体集合大小不影响这些纯格式用例。
+var (
+	snapshotTestVoters = []string{"node-1"}
+	snapshotTestKnown  = map[string]string{"node-1": "127.0.0.1:8801", "node-2": "127.0.0.1:8802"}
+)
+
 // newTestSnapshotter 造一份带独立数据目录的快照句柄。
 func newTestSnapshotter(t *testing.T) (*snapshotter, Config) {
 	t.Helper()
@@ -27,7 +34,7 @@ func TestSnapshotFileByteLayout(t *testing.T) {
 	s, cfg := newTestSnapshotter(t)
 	entries := []kvstore.Entry{{Key: "a", Value: "1"}}
 
-	snap, err := s.create(7, 3, entries)
+	snap, err := s.create(7, 3, entries, snapshotTestVoters)
 	if err != nil {
 		t.Fatalf("create snapshot: %v", err)
 	}
@@ -39,8 +46,11 @@ func TestSnapshotFileByteLayout(t *testing.T) {
 	if string(data[:snapshotMagicLen]) != snapshotMagic {
 		t.Fatalf("magic = %q, want %q", data[:snapshotMagicLen], snapshotMagic)
 	}
-	if got := binary.BigEndian.Uint32(data[snapshotMagicLen:snapshotHeaderLen]); got != 1 {
+	if got := binary.BigEndian.Uint32(data[snapshotMagicLen : snapshotMagicLen+snapshotCountLen]); got != 1 {
 		t.Fatalf("entry count = %d, want 1", got)
+	}
+	if got := binary.BigEndian.Uint16(data[snapshotMagicLen+snapshotCountLen : snapshotHeaderLen]); got != 1 {
+		t.Fatalf("voter count = %d, want 1", got)
 	}
 
 	payload, err := encodeSnapshotRecord("a", "1")
@@ -50,6 +60,9 @@ func TestSnapshotFileByteLayout(t *testing.T) {
 	want := make([]byte, 0, snapshotHeaderLen+kvstore.FrameHeaderSize+len(payload))
 	want = append(want, snapshotMagic...)
 	want = binary.BigEndian.AppendUint32(want, 1)
+	want = binary.BigEndian.AppendUint16(want, 1)
+	want = binary.BigEndian.AppendUint16(want, uint16(len(snapshotTestVoters[0])))
+	want = append(want, snapshotTestVoters[0]...)
 	frame, err := kvstore.EncodeFrame(payload)
 	if err != nil {
 		t.Fatalf("encode frame: %v", err)
@@ -87,7 +100,7 @@ func TestSnapshotFileRoundTripsEveryKeyInOrder(t *testing.T) {
 		{Key: "a", Value: "1"},
 		{Key: "c", Value: "3"},
 	}
-	if _, err := s.create(5, 1, entries); err != nil {
+	if _, err := s.create(5, 1, entries, snapshotTestVoters); err != nil {
 		t.Fatalf("create snapshot: %v", err)
 	}
 
@@ -95,9 +108,12 @@ func TestSnapshotFileRoundTripsEveryKeyInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read snapshot file: %v", err)
 	}
-	got, err := decodeSnapshotFile(data)
+	got, voters, err := decodeSnapshotFile(data, snapshotTestKnown)
 	if err != nil {
 		t.Fatalf("decode snapshot: %v", err)
+	}
+	if len(voters) != 1 || voters[0] != "node-1" {
+		t.Fatalf("decoded voters = %v, want [node-1]", voters)
 	}
 	if len(got) != len(entries) {
 		t.Fatalf("decoded %d entries, want %d", len(got), len(entries))
@@ -112,24 +128,24 @@ func TestSnapshotFileRoundTripsEveryKeyInOrder(t *testing.T) {
 // 条目数与实际帧数对不上判坏记录：少一帧、多一帧都要判。
 func TestSnapshotFileRejectsWrongEntryCount(t *testing.T) {
 	s, _ := newTestSnapshotter(t)
-	if _, err := s.create(1, 1, []kvstore.Entry{{Key: "a", Value: "1"}}); err != nil {
+	if _, err := s.create(1, 1, []kvstore.Entry{{Key: "a", Value: "1"}}, snapshotTestVoters); err != nil {
 		t.Fatalf("create snapshot: %v", err)
 	}
 
-	data, err := encodeSnapshotFile([]kvstore.Entry{{Key: "a", Value: "1"}})
+	data, err := encodeSnapshotFile([]kvstore.Entry{{Key: "a", Value: "1"}}, snapshotTestVoters)
 	if err != nil {
 		t.Fatalf("encode snapshot: %v", err)
 	}
 
 	tooMany := append([]byte(nil), data...)
-	binary.BigEndian.PutUint32(tooMany[snapshotMagicLen:snapshotHeaderLen], 2)
-	if _, err := decodeSnapshotFile(tooMany); !errors.Is(err, kvstore.ErrCorruptRecord) {
+	binary.BigEndian.PutUint32(tooMany[snapshotMagicLen:snapshotMagicLen+snapshotCountLen], 2)
+	if _, _, err := decodeSnapshotFile(tooMany, snapshotTestKnown); !errors.Is(err, kvstore.ErrCorruptRecord) {
 		t.Fatalf("count 2 over 1 frame = %v, want ErrCorruptRecord", err)
 	}
 
 	tooFew := append([]byte(nil), data...)
-	binary.BigEndian.PutUint32(tooFew[snapshotMagicLen:snapshotHeaderLen], 0)
-	if _, err := decodeSnapshotFile(tooFew); !errors.Is(err, kvstore.ErrCorruptRecord) {
+	binary.BigEndian.PutUint32(tooFew[snapshotMagicLen:snapshotMagicLen+snapshotCountLen], 0)
+	if _, _, err := decodeSnapshotFile(tooFew, snapshotTestKnown); !errors.Is(err, kvstore.ErrCorruptRecord) {
 		t.Fatalf("count 0 over 1 frame = %v, want ErrCorruptRecord", err)
 	}
 }
@@ -150,9 +166,12 @@ func TestSnapshotFileRejectsForeignOp(t *testing.T) {
 		}
 		data := append([]byte(snapshotMagic), make([]byte, 0, 4)...)
 		data = binary.BigEndian.AppendUint32(data, 1)
+		data = binary.BigEndian.AppendUint16(data, 1)
+		data = binary.BigEndian.AppendUint16(data, uint16(len(snapshotTestVoters[0])))
+		data = append(data, snapshotTestVoters[0]...)
 		data = append(data, frame...)
 
-		if _, err := decodeSnapshotFile(data); !errors.Is(err, kvstore.ErrCorruptRecord) {
+		if _, _, err := decodeSnapshotFile(data, snapshotTestKnown); !errors.Is(err, kvstore.ErrCorruptRecord) {
 			t.Fatalf("op 0x%02x = %v, want ErrCorruptRecord", op, err)
 		}
 	}
@@ -172,19 +191,27 @@ func TestSnapshotFileRejectsBadFrameChecksum(t *testing.T) {
 
 	data := append([]byte(snapshotMagic), make([]byte, 0, 4)...)
 	data = binary.BigEndian.AppendUint32(data, 1)
+	data = binary.BigEndian.AppendUint16(data, 1)
+	data = binary.BigEndian.AppendUint16(data, uint16(len(snapshotTestVoters[0])))
+	data = append(data, snapshotTestVoters[0]...)
 	data = append(data, frame...)
 
-	if _, err := decodeSnapshotFile(data); !errors.Is(err, kvstore.ErrCorruptRecord) {
+	if _, _, err := decodeSnapshotFile(data, snapshotTestKnown); !errors.Is(err, kvstore.ErrCorruptRecord) {
 		t.Fatalf("bad frame crc = %v, want ErrCorruptRecord", err)
 	}
 }
 
-// magic 不是 MRSNAP01 判坏记录。
+// magic 不是 MRSNAP02 判坏记录，MRSNAP01 同样判坏（6.1 §5）。
 func TestSnapshotFileRejectsBadMagic(t *testing.T) {
-	data := []byte("NOTSNAP1")
-	data = binary.BigEndian.AppendUint32(data, 0)
-	if _, err := decodeSnapshotFile(data); !errors.Is(err, kvstore.ErrCorruptRecord) {
-		t.Fatalf("bad magic = %v, want ErrCorruptRecord", err)
+	for _, magic := range []string{"NOTSNAP1", "MRSNAP01"} {
+		data := []byte(magic)
+		data = binary.BigEndian.AppendUint32(data, 0)
+		data = binary.BigEndian.AppendUint16(data, 1)
+		data = binary.BigEndian.AppendUint16(data, uint16(len(snapshotTestVoters[0])))
+		data = append(data, snapshotTestVoters[0]...)
+		if _, _, err := decodeSnapshotFile(data, snapshotTestKnown); !errors.Is(err, kvstore.ErrCorruptRecord) {
+			t.Fatalf("magic %q = %v, want ErrCorruptRecord", magic, err)
+		}
 	}
 }
 
@@ -199,7 +226,7 @@ func TestSnapshotCreateFailureLeavesNoOfficialFile(t *testing.T) {
 		t.Fatalf("plant a file at the snapshot dir path: %v", err)
 	}
 
-	if _, err := s.create(3, 1, []kvstore.Entry{{Key: "a", Value: "1"}}); err == nil {
+	if _, err := s.create(3, 1, []kvstore.Entry{{Key: "a", Value: "1"}}, snapshotTestVoters); err == nil {
 		t.Fatal("create on a broken snapshot dir = nil error, want an error")
 	}
 	if _, err := os.Stat(cfg.SnapshotPath(3)); err == nil {
@@ -210,7 +237,7 @@ func TestSnapshotCreateFailureLeavesNoOfficialFile(t *testing.T) {
 // 指针写读一致：写完 current.json 里的五个字段与快照元数据逐个相同。
 func TestSnapshotPointerRoundTrips(t *testing.T) {
 	s, cfg := newTestSnapshotter(t)
-	snap, err := s.create(9, 4, []kvstore.Entry{{Key: "a", Value: "1"}, {Key: "b", Value: "2"}})
+	snap, err := s.create(9, 4, []kvstore.Entry{{Key: "a", Value: "1"}, {Key: "b", Value: "2"}}, snapshotTestVoters)
 	if err != nil {
 		t.Fatalf("create snapshot: %v", err)
 	}
@@ -253,7 +280,7 @@ func TestSnapshotPointerBadInputsMeanNoSnapshot(t *testing.T) {
 	// 缺字段与半行 JSON 两种坏输入：指针落在这个样子时快照文件本身是好的，
 	// 认得出坏的只有指针的字段校验这一层。
 	s, cfg := newTestSnapshotter(t)
-	pointer, err := s.create(7, 3, []kvstore.Entry{{Key: "k", Value: "v"}})
+	pointer, err := s.create(7, 3, []kvstore.Entry{{Key: "k", Value: "v"}}, snapshotTestVoters)
 	if err != nil {
 		t.Fatalf("create the snapshot the pointer refers to: %v", err)
 	}
@@ -311,7 +338,7 @@ func TestSnapshotPointerWithoutUsableFileMeansNoSnapshot(t *testing.T) {
 
 	t.Run("checksum mismatch", func(t *testing.T) {
 		s, cfg := newTestSnapshotter(t)
-		if _, err := s.create(4, 1, []kvstore.Entry{{Key: "a", Value: "1"}}); err != nil {
+		if _, err := s.create(4, 1, []kvstore.Entry{{Key: "a", Value: "1"}}, snapshotTestVoters); err != nil {
 			t.Fatalf("create snapshot: %v", err)
 		}
 		if err := os.WriteFile(cfg.SnapshotPointerPath(),
@@ -331,7 +358,7 @@ func TestSnapshotPointerWithoutUsableFileMeansNoSnapshot(t *testing.T) {
 // 启动时临时名文件与没有指针指向的孤儿快照文件被删掉：它们都不是提交点。
 func TestSnapshotCleanupRemovesTmpAndOrphanFiles(t *testing.T) {
 	s, cfg := newTestSnapshotter(t)
-	snap, err := s.create(4, 1, []kvstore.Entry{{Key: "a", Value: "1"}})
+	snap, err := s.create(4, 1, []kvstore.Entry{{Key: "a", Value: "1"}}, snapshotTestVoters)
 	if err != nil {
 		t.Fatalf("create snapshot: %v", err)
 	}
@@ -340,7 +367,7 @@ func TestSnapshotCleanupRemovesTmpAndOrphanFiles(t *testing.T) {
 	}
 
 	// 孤儿快照文件：index 不在指针上；临时名文件：没改名的半成品。
-	if _, err := s.create(9, 1, []kvstore.Entry{{Key: "b", Value: "2"}}); err != nil {
+	if _, err := s.create(9, 1, []kvstore.Entry{{Key: "b", Value: "2"}}, snapshotTestVoters); err != nil {
 		t.Fatalf("create orphan snapshot: %v", err)
 	}
 	if err := os.WriteFile(cfg.SnapshotTmpPath(11), []byte("half written"), 0o644); err != nil {
@@ -368,7 +395,7 @@ func TestSnapshotCleanupRemovesTmpAndOrphanFiles(t *testing.T) {
 // 没有指针时快照目录里的快照文件全是孤儿，启动后目录里不留它们。
 func TestSnapshotCleanupRemovesEveryFileWithoutPointer(t *testing.T) {
 	s, cfg := newTestSnapshotter(t)
-	if _, err := s.create(3, 1, []kvstore.Entry{{Key: "a", Value: "1"}}); err != nil {
+	if _, err := s.create(3, 1, []kvstore.Entry{{Key: "a", Value: "1"}}, snapshotTestVoters); err != nil {
 		t.Fatalf("create snapshot: %v", err)
 	}
 	if _, _, err := s.load(); err != nil {

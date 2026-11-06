@@ -250,11 +250,12 @@ func (n *Node) scheduleReadRound() {
 		zap.Uint64("read_round", round.round),
 		zap.Int("reads", len(members)),
 		zap.Int64("start_mono_ms", round.startNS/int64(time.Millisecond)))
-	for _, peerID := range n.cfg.otherPeers() {
+	// 确认轮只发给投票集合的成员；learner 收到心跳时带回来的轮次号不计票（6.1 §7）。
+	for _, peerID := range n.membership.others(n.cfg.NodeID) {
 		n.appendOnce(peerID)
 	}
-	// 成员表只有自己的时候没有回执可等：自票已经凑够多数派，当场结算（docs/8 §二 的单节点集群）。
-	if round.acks >= n.cfg.Majority() {
+	// 投票集合只有自己的时候没有回执可等：自票已经凑够多数派，当场结算（docs/8 §二 的单节点集群）。
+	if round.acks >= n.membership.majority() {
 		n.settleReadRound(round)
 	}
 }
@@ -263,7 +264,7 @@ func (n *Node) scheduleReadRound() {
 // 编号对不上就是跨轮回执，丢弃并打日志；票到多数派立即结算。
 // 调用方必须持锁。
 func (n *Node) countReadRound(peerID string, reply AppendReply) {
-	if reply.ReadRound == 0 {
+	if reply.ReadRound == 0 || !n.membership.isVoter(peerID) {
 		return
 	}
 	if n.activeRound == nil {
@@ -282,7 +283,7 @@ func (n *Node) countReadRound(peerID string, reply AppendReply) {
 		return
 	}
 	round.acks++
-	if round.acks < n.cfg.Majority() {
+	if round.acks < n.membership.majority() {
 		return
 	}
 	n.settleReadRound(round)

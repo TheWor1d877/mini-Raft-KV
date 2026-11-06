@@ -30,6 +30,21 @@ func validConfig() Config {
 	return cfg
 }
 
+// -learner-demote-ms 为负直接报错；0 与默认值都通过（6.1 §6）。
+func TestValidateLearnerDemoteMS(t *testing.T) {
+	cfg := validConfig()
+	cfg.LearnerDemoteMS = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("negative learner demote = nil error, want an error")
+	}
+	for _, ms := range []int64{0, DefaultLearnerDemoteMS} {
+		cfg.LearnerDemoteMS = ms
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("learner demote %dms = %v, want nil", ms, err)
+		}
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	t.Helper()
 	cfg := validConfig()
